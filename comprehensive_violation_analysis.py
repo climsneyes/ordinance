@@ -1,6 +1,7 @@
 """
 종합 위법성 분석 모듈
 조례안과 PKL 데이터베이스의 위법 판례를 매칭하여 종합적인 위법성 분석을 수행합니다.
+법령명 정규화를 통해 중복을 제거하고 Gemini API 호출을 최적화합니다.
 """
 
 import pickle
@@ -10,6 +11,7 @@ import re
 import os
 from typing import List, Dict, Any, Tuple
 import streamlit as st
+from law_name_normalizer import LawNameNormalizer
 
 def load_vectorstore_safe(pkl_path: str) -> Dict[str, Any]:
     """안전한 벡터스토어 로드"""
@@ -61,6 +63,66 @@ def extract_ordinance_articles(pdf_text: str) -> List[Dict[str, str]]:
             })
     
     return articles
+
+def extract_law_names_from_text(text: str) -> List[str]:
+    """텍스트에서 법령명 추출"""
+    law_names = []
+
+    # 법령명 패턴들
+    patterns = [
+        r'([^.\n]*?법)[.\s]',  # ~법
+        r'([^.\n]*?령)[.\s]',  # ~령 (시행령, 대통령령 등)
+        r'([^.\n]*?규칙)[.\s]',  # ~규칙
+        r'([^.\n]*?조례)[.\s]',  # ~조례
+        r'([^.\n]*?규정)[.\s]',  # ~규정
+        r'헌법\s*제\s*\d+조',  # 헌법 조문
+        r'(지방자치법)',  # 특정 중요 법령
+        r'(지방교부세법)',
+        r'(국가재정법)',
+        r'(공공기관의\s*운영에\s*관한\s*법률)',
+        r'(행정절차법)',
+        r'(행정기본법)',
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                match = match[0]
+
+            # 정리
+            clean_name = re.sub(r'\s+', ' ', match).strip()
+            if len(clean_name) >= 3 and clean_name not in law_names:
+                law_names.append(clean_name)
+
+    return law_names
+
+def normalize_and_deduplicate_laws(law_names: List[str]) -> List[str]:
+    """법령명 정규화 및 중복 제거"""
+    if not law_names:
+        return []
+
+    normalizer = LawNameNormalizer()
+
+    try:
+        # 법령명 정규화 및 중복 제거
+        normalized_laws = normalizer.deduplicate_laws(law_names, min_similarity=0.85)
+
+        st.write(f"[DEBUG] 법령명 정규화: {len(law_names)}개 → {len(normalized_laws)}개")
+
+        # 정규화 결과 표시
+        if len(law_names) != len(normalized_laws):
+            st.write(f"[INFO] 중복 제거된 법령:")
+            for i, (original, normalized) in enumerate(zip(law_names, normalized_laws)):
+                if original != normalized:
+                    st.write(f"  - '{original}' → '{normalized}'")
+
+        return normalized_laws
+
+    except Exception as e:
+        st.error(f"법령명 정규화 오류: {e}")
+        # 오류시 간단한 중복 제거만 수행
+        return list(set(law_names))
 
 def calculate_text_similarity(text1: str, text2: str, model) -> float:
     """두 텍스트 간 유사도 계산"""
@@ -312,10 +374,114 @@ def search_comprehensive_violation_cases(ordinance_articles: List[Dict], pkl_pat
         
         st.write(f"[DEBUG] 종합 위법성 분석 완료: {len(comprehensive_results)}개 조문에서 위험 발견")
         return comprehensive_results
-        
+
     except Exception as e:
         st.error(f"종합 위법성 분석 오류: {str(e)}")
         return []
+
+def extract_and_normalize_relevant_laws(comprehensive_results: List[Dict]) -> Dict[str, List[str]]:
+    """분석 결과에서 관련 법령명을 추출하고 정규화"""
+    if not comprehensive_results:
+        return {'normalized_laws': [], 'law_details': []}
+
+    st.write("### 📋 관련 법령명 추출 및 정규화")
+
+    all_law_names = []
+    law_sources = {}  # 법령이 어느 조문에서 나왔는지 추적
+
+    try:
+        # 1. 모든 위법 사례에서 법령명 추출
+        for result in comprehensive_results:
+            article_num = result.get('ordinance_article', '')
+
+            # 조례 내용에서 법령명 추출
+            ordinance_content = result.get('ordinance_content', '')
+            if ordinance_content:
+                extracted_laws = extract_law_names_from_text(ordinance_content)
+                for law in extracted_laws:
+                    all_law_names.append(law)
+                    if law not in law_sources:
+                        law_sources[law] = []
+                    law_sources[law].append(f"{article_num} (조례)")
+
+            # 위험 사례 내용에서 법령명 추출
+            for violation_risk in result.get('violation_risks', []):
+                case_summary = violation_risk.get('case_summary', '')
+                if case_summary:
+                    extracted_laws = extract_law_names_from_text(case_summary)
+                    for law in extracted_laws:
+                        all_law_names.append(law)
+                        if law not in law_sources:
+                            law_sources[law] = []
+                        law_sources[law].append(f"{article_num} (사례)")
+
+        st.write(f"[DEBUG] 총 {len(all_law_names)}개 법령명 추출됨")
+
+        # 2. 법령명 정규화 및 중복 제거
+        if all_law_names:
+            normalized_laws = normalize_and_deduplicate_laws(all_law_names)
+
+            # 3. 정규화된 법령 정보와 출처 매핑
+            law_details = []
+            normalizer = LawNameNormalizer()
+
+            for law in normalized_laws:
+                # 정규화된 법령의 상세 정보 조회
+                law_info = normalizer.get_best_match_with_info(law)
+
+                # 출처 정보 추가
+                related_sources = []
+                for original_law, sources in law_sources.items():
+                    # 원본 법령과 정규화된 법령이 유사한지 확인
+                    if normalizer._calculate_similarity(
+                        original_law.lower(),
+                        law.lower()
+                    ) >= 0.8:
+                        related_sources.extend(sources)
+
+                law_details.append({
+                    'law_name': law_info['title'],
+                    'law_number': law_info.get('number', ''),
+                    'law_type': law_info.get('type', ''),
+                    'enforcement_date': law_info.get('enforcement_date', ''),
+                    'similarity_score': law_info.get('similarity', 0.0),
+                    'related_articles': list(set(related_sources)),  # 중복 제거
+                    'api_error': law_info.get('error', None)
+                })
+
+            # 결과 요약 표시
+            st.write(f"**✅ 정규화 완료**: {len(normalized_laws)}개 법령")
+
+            # 중복 제거 효과 표시
+            if len(all_law_names) > len(normalized_laws):
+                st.success(f"🎯 중복 제거 효과: {len(all_law_names)}개 → {len(normalized_laws)}개 ({((len(all_law_names) - len(normalized_laws)) / len(all_law_names) * 100):.1f}% 감소)")
+
+            # 상위 관련 법령 표시
+            with st.expander("🔍 추출된 주요 법령 미리보기", expanded=False):
+                for i, detail in enumerate(law_details[:10], 1):  # 상위 10개만
+                    st.write(f"{i}. **{detail['law_name']}**")
+                    if detail['law_number']:
+                        st.write(f"   - 법령번호: {detail['law_number']}")
+                    if detail['related_articles']:
+                        st.write(f"   - 관련 조문: {', '.join(detail['related_articles'][:3])}")  # 최대 3개만
+                    if detail['api_error']:
+                        st.write(f"   ⚠️ API 오류: {detail['api_error']}")
+
+            return {
+                'normalized_laws': normalized_laws,
+                'law_details': law_details,
+                'original_count': len(all_law_names),
+                'normalized_count': len(normalized_laws),
+                'reduction_rate': ((len(all_law_names) - len(normalized_laws)) / len(all_law_names) * 100) if all_law_names else 0
+            }
+
+        else:
+            st.warning("추출된 법령명이 없습니다.")
+            return {'normalized_laws': [], 'law_details': [], 'original_count': 0, 'normalized_count': 0, 'reduction_rate': 0}
+
+    except Exception as e:
+        st.error(f"법령명 추출/정규화 오류: {e}")
+        return {'normalized_laws': [], 'law_details': [], 'error': str(e)}
 
 def search_theoretical_background(problem_keywords: List[str], pkl_paths: List[str], max_results: int = 8, context_analysis: Dict = None) -> List[Dict]:
     """발견된 문제점에 대한 이론적 배경을 PKL에서 검색"""
@@ -701,6 +867,231 @@ def test_comprehensive_analysis():
         # 결과 포맷팅
         formatted = format_comprehensive_analysis_result(results)
         print(formatted[:500] + "...")
+
+def create_optimized_analysis_payload(comprehensive_results: List[Dict], law_analysis: Dict, theoretical_background: List[Dict] = None) -> Dict[str, Any]:
+    """Gemini API 호출을 위한 최적화된 분석 페이로드 생성"""
+
+    if not comprehensive_results:
+        return {'error': '분석 결과가 없습니다.'}
+
+    try:
+        st.write("### 🚀 Gemini API 호출 최적화")
+
+        # 1. 핵심 위험 사례만 선별 (상위 위험도)
+        high_risk_cases = []
+        for result in comprehensive_results:
+            for risk in result.get('violation_risks', []):
+                if risk.get('risk_score', 0) >= 0.6:  # 위험도 0.6 이상만
+                    high_risk_cases.append({
+                        'article': result.get('ordinance_article', ''),
+                        'risk_type': risk.get('violation_type', ''),
+                        'risk_score': risk.get('risk_score', 0),
+                        'case_summary': risk.get('case_summary', '')[:500],  # 500자로 제한
+                        'similarity': risk.get('similarity', 0)
+                    })
+
+        # 위험도 순으로 정렬하고 상위 10개만 선택
+        high_risk_cases.sort(key=lambda x: x['risk_score'], reverse=True)
+        selected_cases = high_risk_cases[:10]
+
+        st.write(f"**✅ 고위험 사례 선별**: {len(high_risk_cases)}개 중 {len(selected_cases)}개 선택")
+
+        # 2. 관련 법령 요약 (정규화된 법령만)
+        relevant_laws_summary = []
+        if law_analysis.get('law_details'):
+            # 상위 5개 법령만 선택
+            top_laws = sorted(
+                law_analysis['law_details'],
+                key=lambda x: x.get('similarity_score', 0),
+                reverse=True
+            )[:5]
+
+            for law_detail in top_laws:
+                relevant_laws_summary.append({
+                    'law_name': law_detail['law_name'],
+                    'law_type': law_detail.get('law_type', ''),
+                    'related_articles_count': len(law_detail.get('related_articles', []))
+                })
+
+        st.write(f"**✅ 관련 법령 요약**: {len(relevant_laws_summary)}개 법령")
+
+        # 3. 이론적 배경 요약 (있는 경우)
+        theory_summary = []
+        if theoretical_background:
+            for theory in theoretical_background[:5]:  # 상위 5개만
+                theory_summary.append({
+                    'principle': theory.get('legal_principle', '')[:200],  # 200자로 제한
+                    'relevance': theory.get('relevance_score', 0)
+                })
+
+        # 4. 통합 페이로드 생성
+        optimized_payload = {
+            'analysis_summary': {
+                'total_articles_analyzed': len(comprehensive_results),
+                'high_risk_cases_count': len(selected_cases),
+                'relevant_laws_count': len(relevant_laws_summary),
+                'law_normalization_effect': {
+                    'original_count': law_analysis.get('original_count', 0),
+                    'normalized_count': law_analysis.get('normalized_count', 0),
+                    'reduction_rate': law_analysis.get('reduction_rate', 0)
+                }
+            },
+            'high_risk_violations': selected_cases,
+            'relevant_laws': relevant_laws_summary,
+            'theoretical_background': theory_summary,
+            'optimization_metrics': {
+                'total_text_length': sum(len(case.get('case_summary', '')) for case in selected_cases),
+                'api_calls_saved': len(high_risk_cases) - len(selected_cases),
+                'token_efficiency': f"약 {(len(high_risk_cases) - len(selected_cases)) * 1000} 토큰 절약"
+            }
+        }
+
+        # 5. 페이로드 크기 체크
+        import json
+        payload_size = len(json.dumps(optimized_payload, ensure_ascii=False))
+
+        st.write(f"**📊 최적화 효과**:")
+        st.write(f"  - 선별된 사례: {len(selected_cases)}개 (전체 {len(high_risk_cases)}개 중)")
+        st.write(f"  - 페이로드 크기: {payload_size:,} bytes")
+        st.write(f"  - 예상 API 호출 절약: {len(high_risk_cases) - len(selected_cases)}회")
+
+        if law_analysis.get('reduction_rate', 0) > 0:
+            st.success(f"  - 법령명 중복 제거: {law_analysis['reduction_rate']:.1f}% 절약")
+
+        return optimized_payload
+
+    except Exception as e:
+        st.error(f"페이로드 최적화 오류: {e}")
+        return {'error': str(e)}
+
+def format_optimized_prompt_for_gemini(payload: Dict[str, Any]) -> str:
+    """최적화된 Gemini 프롬프트 생성"""
+
+    if payload.get('error'):
+        return f"분석 오류: {payload['error']}"
+
+    try:
+        prompt_parts = []
+
+        # 1. 분석 개요
+        summary = payload.get('analysis_summary', {})
+        prompt_parts.append(f"""
+## 조례 위법성 종합 분석 결과
+
+**분석 개요:**
+- 분석 대상 조문: {summary.get('total_articles_analyzed', 0)}개
+- 고위험 사례: {summary.get('high_risk_cases_count', 0)}개
+- 관련 법령: {summary.get('relevant_laws_count', 0)}개
+
+**최적화 효과:**
+- 법령명 정규화: {summary.get('law_normalization_effect', {}).get('original_count', 0)}개 → {summary.get('law_normalization_effect', {}).get('normalized_count', 0)}개
+- 중복 제거율: {summary.get('law_normalization_effect', {}).get('reduction_rate', 0):.1f}%
+""")
+
+        # 2. 고위험 위법 사례
+        high_risk_cases = payload.get('high_risk_violations', [])
+        if high_risk_cases:
+            prompt_parts.append("\n## 🚨 주요 위법 위험 사례\n")
+            for i, case in enumerate(high_risk_cases, 1):
+                prompt_parts.append(f"""
+**{i}. {case.get('article', '')} - {case.get('risk_type', '')}**
+- 위험도: {case.get('risk_score', 0):.2f}
+- 유사도: {case.get('similarity', 0):.2f}
+- 사례 요약: {case.get('case_summary', '')[:300]}...
+""")
+
+        # 3. 관련 법령
+        relevant_laws = payload.get('relevant_laws', [])
+        if relevant_laws:
+            prompt_parts.append("\n## 📋 관련 주요 법령\n")
+            for i, law in enumerate(relevant_laws, 1):
+                prompt_parts.append(f"""
+**{i}. {law.get('law_name', '')}**
+- 법령 유형: {law.get('law_type', '')}
+- 관련 조문 수: {law.get('related_articles_count', 0)}개
+""")
+
+        # 4. 분석 요청
+        prompt_parts.append("""
+## 📝 분석 요청
+
+위 정보를 바탕으로 다음 사항에 대해 종합적으로 분석해 주세요:
+
+1. **위법성 평가**: 각 조문별 위법 위험도와 근거
+2. **법령 충돌 분석**: 상위법령과의 충돌 가능성
+3. **개선 방안**: 구체적인 조례 개선 권고사항
+4. **법적 근거**: 관련 법령 및 판례 인용
+5. **우선순위**: 수정이 필요한 조문의 우선순위
+
+**분석 시 고려사항:**
+- 법령 간 위계 관계
+- 지방자치단체의 자치권 범위
+- 실무적 적용 가능성
+""")
+
+        final_prompt = "".join(prompt_parts)
+
+        # 프롬프트 길이 체크
+        st.write(f"**📝 생성된 프롬프트**: {len(final_prompt):,}자")
+
+        return final_prompt
+
+    except Exception as e:
+        return f"프롬프트 생성 오류: {e}"
+
+def analyze_comprehensive_violations_optimized(ordinance_text: str, pkl_paths: List[str]) -> Dict[str, Any]:
+    """최적화된 종합 위법성 분석 (전체 프로세스)"""
+
+    st.write("# 🔍 최적화된 종합 위법성 분석")
+
+    try:
+        # 1. 조문 추출
+        st.write("## 1단계: 조문 추출")
+        articles = extract_ordinance_articles(ordinance_text)
+        st.write(f"✅ {len(articles)}개 조문 추출")
+
+        if not articles:
+            return {'error': '조문을 추출할 수 없습니다.'}
+
+        # 2. 위법 사례 검색
+        st.write("## 2단계: 위법 사례 검색")
+        comprehensive_results = search_comprehensive_violation_cases(articles, pkl_paths)
+        st.write(f"✅ {len(comprehensive_results)}개 조문에서 위험 발견")
+
+        if not comprehensive_results:
+            return {'error': '위법 사례를 찾을 수 없습니다.'}
+
+        # 3. 법령명 추출 및 정규화
+        st.write("## 3단계: 법령명 정규화")
+        law_analysis = extract_and_normalize_relevant_laws(comprehensive_results)
+
+        # 4. 최적화된 페이로드 생성
+        st.write("## 4단계: Gemini API 최적화")
+        optimized_payload = create_optimized_analysis_payload(comprehensive_results, law_analysis)
+
+        # 5. Gemini 프롬프트 생성
+        gemini_prompt = format_optimized_prompt_for_gemini(optimized_payload)
+
+        # 최종 결과 반환
+        return {
+            'success': True,
+            'articles_count': len(articles),
+            'violations_found': len(comprehensive_results),
+            'law_normalization': law_analysis,
+            'optimized_payload': optimized_payload,
+            'gemini_prompt': gemini_prompt,
+            'optimization_summary': {
+                'original_violations': sum(len(r.get('violation_risks', [])) for r in comprehensive_results),
+                'selected_violations': len(optimized_payload.get('high_risk_violations', [])),
+                'laws_normalized': law_analysis.get('normalized_count', 0),
+                'laws_original': law_analysis.get('original_count', 0),
+                'reduction_rate': law_analysis.get('reduction_rate', 0)
+            }
+        }
+
+    except Exception as e:
+        st.error(f"최적화된 분석 오류: {e}")
+        return {'error': str(e)}
 
 if __name__ == "__main__":
     test_comprehensive_analysis()
