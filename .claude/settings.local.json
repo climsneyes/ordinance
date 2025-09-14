@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone:*)",
+      "Bash(python:*)",
+      "Bash(streamlit run:*)",
+      "WebFetch(domain:open.law.go.kr)",
+      "Bash(dir:*)",
+      "Read(//c/Users/yonom/Downloads/**)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "WebFetch(domain:www.law.go.kr)",
+      "Bash(pip install:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
