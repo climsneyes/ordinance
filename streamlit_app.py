@@ -83,6 +83,7 @@ st.markdown("""
 OC = "climsneys85"
 search_url = "http://www.law.go.kr/DRF/lawSearch.do"
 detail_url = "http://www.law.go.kr/DRF/lawService.do"
+precedent_search_url = "http://www.law.go.kr/DRF/lawSearch.do"  # 판례 검색 API
 
 # 광역지자체 코드 및 이름
 metropolitan_govs = {
@@ -792,6 +793,7 @@ def group_laws_by_hierarchy(superior_laws):
     for original in superior_laws:
         normalized = normalize_law_name(original)
         if normalized != original:
+            pass  # 정규화된 경우 처리 (디버깅 코드 제거됨)
 
     # 2단계: 정규화된 법령명으로 그룹화
     for law_name in normalized_laws:
@@ -1131,6 +1133,144 @@ def extract_legal_reasoning_from_analysis(analysis_text):
 
     return extracted_context
 
+def search_precedents(query_keywords, max_results=10):
+    """국가법령정보센터 API를 통한 판례 검색"""
+    try:
+        # 검색 키워드 최적화
+        if isinstance(query_keywords, list):
+            search_query = ' '.join(query_keywords[:3])  # 최대 3개 키워드
+        else:
+            search_query = query_keywords
+
+        # API 요청 파라미터
+        params = {
+            'OC': OC,
+            'target': 'prec',  # 판례 검색
+            'type': 'XML',
+            'query': search_query,
+            'display': min(max_results, 20)  # 최대 20개
+        }
+
+        st.info(f"🔍 판례 검색 중: '{search_query}'")
+
+        response = requests.get(precedent_search_url, params=params, timeout=30)
+        if response.status_code != 200:
+            st.warning(f"판례 검색 API 오류: HTTP {response.status_code}")
+            return []
+
+        root = ET.fromstring(response.text)
+        precedents = []
+
+        # XML 응답 파싱
+        for prec_elem in root.findall('.//PrecSearch'):
+            try:
+                prec_id = prec_elem.find('판례일련번호')
+                case_name = prec_elem.find('사건명')
+                court = prec_elem.find('법원명')
+                date = prec_elem.find('선고일자')
+                case_type = prec_elem.find('사건종류명')
+
+                if all(elem is not None for elem in [prec_id, case_name]):
+                    precedent = {
+                        'id': prec_id.text,
+                        'case_name': case_name.text,
+                        'court': court.text if court is not None else '',
+                        'date': date.text if date is not None else '',
+                        'case_type': case_type.text if case_type is not None else '',
+                        'summary': ''  # 요약문은 상세 조회에서 가져올 예정
+                    }
+                    precedents.append(precedent)
+            except Exception as e:
+                continue
+
+        st.success(f"📋 {len(precedents)}개의 관련 판례를 발견했습니다.")
+        return precedents[:max_results]
+
+    except Exception as e:
+        st.error(f"판례 검색 오류: {str(e)}")
+        return []
+
+def get_precedent_detail(precedent_id):
+    """판례 상세 내용 조회"""
+    try:
+        params = {
+            'OC': OC,
+            'target': 'prec',
+            'ID': precedent_id,
+            'type': 'XML'
+        }
+
+        response = requests.get(detail_url, params=params, timeout=30)
+        if response.status_code != 200:
+            return None
+
+        root = ET.fromstring(response.text)
+
+        # 판례 본문 추출
+        content = ""
+
+        # 판시사항
+        decision_matters = root.find('.//판시사항')
+        if decision_matters is not None and decision_matters.text:
+            content += f"[판시사항]\n{decision_matters.text}\n\n"
+
+        # 판결요지
+        decision_summary = root.find('.//판결요지')
+        if decision_summary is not None and decision_summary.text:
+            content += f"[판결요지]\n{decision_summary.text}\n\n"
+
+        # 참조조문
+        ref_articles = root.find('.//참조조문')
+        if ref_articles is not None and ref_articles.text:
+            content += f"[참조조문]\n{ref_articles.text}\n\n"
+
+        # 전문 (주요 부분만)
+        full_text = root.find('.//전문')
+        if full_text is not None and full_text.text:
+            # 전문이 너무 길 경우 앞부분만 가져옴
+            full_content = full_text.text
+            if len(full_content) > 2000:
+                full_content = full_content[:2000] + "..."
+            content += f"[전문]\n{full_content}\n\n"
+
+        return content.strip() if content else None
+
+    except Exception as e:
+        st.warning(f"판례 상세 조회 오류: {str(e)}")
+        return None
+
+def extract_legal_principles_from_precedents(precedents_content):
+    """판례에서 법리 추출"""
+    legal_principles = []
+
+    for i, content in enumerate(precedents_content):
+        if not content:
+            continue
+
+        # 법리 추출 패턴
+        principle_patterns = [
+            r'법원은.*?고 판시하였다',
+            r'대법원은.*?고 본다',
+            r'이 사건에 관하여.*?것이다',
+            r'따라서.*?할 것이다',
+            r'그러므로.*?라고 할 것이다',
+            r'헌법재판소는.*?고 판단한다'
+        ]
+
+        extracted_principles = []
+        for pattern in principle_patterns:
+            matches = re.findall(pattern, content, re.DOTALL)
+            for match in matches:
+                # 문장 정리
+                clean_principle = re.sub(r'\s+', ' ', match.strip())
+                if len(clean_principle) > 50 and clean_principle not in extracted_principles:
+                    extracted_principles.append(clean_principle)
+
+        if extracted_principles:
+            legal_principles.extend(extracted_principles[:2])  # 판례당 최대 2개 법리
+
+    return legal_principles[:6]  # 전체 최대 6개 법리
+
 def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
     """쿼리와 관련된 가이드라인 검색 (Gemini 기반 또는 무료 버전)"""
     try:
@@ -1185,7 +1325,9 @@ def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
                     if keyword_count >= 1:
                         keyword_filtered_indices.append(idx)
                     else:
+                        pass  # 키워드 부족한 경우 (디버깅 코드 제거됨)
                 else:
+                    pass  # 한글 부족한 경우 (디버깅 코드 제거됨)
 
             except Exception as e:
                 continue
@@ -1193,6 +1335,7 @@ def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
         if keyword_filtered_indices:
             valid_indices = np.array(keyword_filtered_indices)
         else:
+            pass  # 키워드 필터링 결과가 없는 경우 (디버깅 코드 제거됨)
 
         if len(valid_indices) == 0:
             return []
@@ -1503,7 +1646,7 @@ def analyze_ordinance_vs_superior_laws(pdf_text, superior_laws_content):
     
     return comparison_results
 
-def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None, relevant_guidelines=None, is_first_ordinance=False, comprehensive_analysis_results=None, theoretical_results=None):
+def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None, relevant_guidelines=None, is_first_ordinance=False, comprehensive_analysis_results=None, theoretical_results=None, precedents_content=None, legal_principles=None):
     """분석 프롬프트 생성 함수"""
     prompt = (
         "🚨 **중요 미션: 실제 위법 내용 찾기**\n"
@@ -1643,6 +1786,44 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
             prompt += f"내용: {content_preview}\n\n"
 
         prompt += "**⚠️ 중요**: 위 판례들은 조례의 문제점과 직접 관련이 있으므로, 이를 근거로 현재 조례의 위법성을 구체적으로 지적하고 개선방안을 제시하라.\n"
+        prompt += "---\n"
+
+    # 판례 검색 결과 추가
+    if precedents_content and len(precedents_content) > 0:
+        prompt += f"\n**⚖️ 관련 판례 검토 결과 ({len(precedents_content)}개)**\n"
+        prompt += "아래는 조례와 관련된 쟁점에 대한 판례들이다. 이 판례들의 법리를 현재 조례에 적용하여 위법성을 판단해줘.\n"
+        prompt += "---\n"
+
+        for i, precedent in enumerate(precedents_content[:3]):  # 최대 3개 판례
+            prompt += f"◆ 판례 {i+1}\n"
+            if isinstance(precedent, dict):
+                if 'case_name' in precedent:
+                    prompt += f"사건명: {precedent['case_name']}\n"
+                if 'court' in precedent:
+                    prompt += f"법원: {precedent['court']}\n"
+                if 'date' in precedent:
+                    prompt += f"선고일: {precedent['date']}\n"
+                content = precedent.get('content', '')
+            else:
+                content = str(precedent)
+
+            # 판례 내용 요약 (500자 제한)
+            if len(content) > 500:
+                content = content[:500] + "..."
+            prompt += f"판례 내용:\n{content}\n\n"
+
+        prompt += "---\n"
+
+    # 추출된 법리 추가
+    if legal_principles and len(legal_principles) > 0:
+        prompt += f"\n**📖 판례로부터 추출된 법리 ({len(legal_principles)}개)**\n"
+        prompt += "위 판례들로부터 추출된 핵심 법리들이다. 이 법리들을 현재 조례에 적용하여 위법성을 구체적으로 판단하라.\n"
+        prompt += "---\n"
+
+        for i, principle in enumerate(legal_principles[:5]):  # 최대 5개 법리
+            prompt += f"{i+1}. {principle}\n\n"
+
+        prompt += "**📍 중요**: 위 법리들을 근거로 현재 조례의 구체적인 조문이 어떤 법적 문제가 있는지 명확히 지적하고, 개선방안을 제시하라.\n"
         prompt += "---\n"
 
     if is_first_ordinance:
@@ -2436,7 +2617,7 @@ def main():
                             if superior_laws_content:
                                 st.success(f"✅ {len(superior_laws_content)}개의 상위법령 그룹을 성공적으로 조회했습니다:")
                                 total_articles = 0
-                                for law_group in superior_laws_content:
+                                for i, law_group in enumerate(superior_laws_content):
                                     base_name = law_group['base_name']
                                     
                                     # 연결된 본문이 있는 경우
@@ -2462,34 +2643,34 @@ def main():
                                 st.markdown(f"   **전체 조문 수**: {total_articles}개")
                                 
                                 # 🆕 상위법령 본문 내용 디버깅 표시
-                                            
-                                            # 연결된 본문이 있는 경우
-                                            if 'combined_content' in law_group and law_group['combined_content']:
-                                                content = law_group['combined_content']
-                                                st.markdown(f"**본문 길이**: {len(content):,}자")
-                                                st.text_area(
-                                                    f"{law_group['base_name']} 본문",
-                                                    content,
-                                                    height=200,
-                                                    key=f"content_{i}"
-                                                )
-                                            else:
-                                                # 개별 법령별 표시
-                                                for law_type, law_info in law_group['laws'].items():
-                                                    if law_info and 'articles' in law_info:
-                                                        type_name = {"law": "법률", "decree": "시행령", "rule": "시행규칙"}[law_type]
-                                                        st.markdown(f"#### {type_name}")
-                                                        
-                                                        # 조문별 내용 표시 (처음 5개만)
-                                                        for j, article in enumerate(law_info['articles'][:5]):
-                                                            st.markdown(f"**제{article.get('number', '?')}조** {article.get('title', '')}")
-                                                            content = article.get('content', '')[:500]
-                                                            st.markdown(f"```\n{content}{'...' if len(article.get('content', '')) > 500 else ''}\n```")
-                                                        
-                                                        if len(law_info['articles']) > 5:
-                                                            st.markdown(f"... (총 {len(law_info['articles'])}개 조문 중 5개만 표시)")
-                                            
-                                            st.markdown("---")
+
+                                # 연결된 본문이 있는 경우
+                                if 'combined_content' in law_group and law_group['combined_content']:
+                                    content = law_group['combined_content']
+                                    st.markdown(f"**본문 길이**: {len(content):,}자")
+                                    st.text_area(
+                                        f"{law_group['base_name']} 본문",
+                                        content,
+                                        height=200,
+                                        key=f"content_{i}"
+                                    )
+                                else:
+                                    # 개별 법령별 표시
+                                    for law_type, law_info in law_group['laws'].items():
+                                        if law_info and 'articles' in law_info:
+                                            type_name = {"law": "법률", "decree": "시행령", "rule": "시행규칙"}[law_type]
+                                            st.markdown(f"#### {type_name}")
+
+                                            # 조문별 내용 표시 (처음 5개만)
+                                            for j, article in enumerate(law_info['articles'][:5]):
+                                                st.markdown(f"**제{article.get('number', '?')}조** {article.get('title', '')}")
+                                                content = article.get('content', '')[:500]
+                                                st.markdown(f"```\n{content}{'...' if len(article.get('content', '')) > 500 else ''}\n```")
+
+                                            if len(law_info['articles']) > 5:
+                                                st.markdown(f"... (총 {len(law_info['articles'])}개 조문 중 5개만 표시)")
+
+                                st.markdown("---")
                                 
                                 # 2-1단계: 상위법령 직접 비교 분석
                                 st.info("⚖️ 2-1단계: 조례와 상위법령 직접 비교 분석을 수행합니다...")
@@ -2584,37 +2765,94 @@ def main():
                                 genai.configure(api_key=gemini_api_key)
                                 model = genai.GenerativeModel('gemini-2.0-flash-lite')
                                 
-                                # 1차 분석용 프롬프트 (문제점 탐지 중심)
-                                # 검색된 판례 정보 가져오기
+                                # 🆕 판례 검색 및 법리 추출
+                                st.info("🔍 관련 판례 검색 중...")
+
+                                # 조례 제목에서 검색 키워드 추출
+                                ordinance_keywords = []
+                                if pdf_text:
+                                    # 조례 제목 추출 시도
+                                    title_match = re.search(r'(?:조례|규칙)\s*$|(?:조례|규칙)\s*[제정|개정|폐지]', pdf_text[:200])
+                                    if title_match:
+                                        title_area = pdf_text[:title_match.end()]
+                                        # 핵심 키워드 추출
+                                        keywords = re.findall(r'[가-힣]{2,6}(?:조례|규칙|관리|지원|운영|설치|위원회)', title_area)
+                                        ordinance_keywords.extend(keywords[:3])
+
+                                # 상위법령명에서도 키워드 추출
+                                if superior_laws_content:
+                                    for law_group in superior_laws_content[:2]:
+                                        law_name = law_group.get('base_name', '')
+                                        law_keywords = re.findall(r'[가-힣]{2,8}(?:법|령)', law_name)
+                                        ordinance_keywords.extend(law_keywords[:2])
+
+                                # 중복 제거 및 최종 키워드 선정
+                                unique_keywords = list(set(ordinance_keywords))[:3]
+
+                                # 판례 검색 실행
+                                precedents = []
+                                precedents_content = []
+                                legal_principles = []
+
+                                if unique_keywords:
+                                    search_query = ' '.join(unique_keywords)
+                                    precedents = search_precedents(search_query, max_results=5)
+
+                                    if precedents:
+                                        st.success(f"📋 {len(precedents)}개 판례 검색 완료")
+
+                                        # 판례 상세 내용 가져오기
+                                        progress_bar = st.progress(0)
+                                        for i, precedent in enumerate(precedents[:3]):  # 최대 3개만 상세 조회
+                                            detail_content = get_precedent_detail(precedent['id'])
+                                            if detail_content:
+                                                precedent['content'] = detail_content
+                                                precedents_content.append(precedent)
+                                            progress_bar.progress((i+1) / min(len(precedents), 3))
+
+                                        # 판례에서 법리 추출
+                                        if precedents_content:
+                                            contents_only = [p.get('content', '') for p in precedents_content]
+                                            legal_principles = extract_legal_principles_from_precedents(contents_only)
+
+                                            if legal_principles:
+                                                st.success(f"⚖️ {len(legal_principles)}개 법리 추출 완료")
+                                            else:
+                                                st.info("법리 추출 결과가 없습니다.")
+                                    else:
+                                        st.info("관련 판례를 찾을 수 없습니다.")
+                                else:
+                                    st.info("검색 키워드를 추출할 수 없어 판례 검색을 생략합니다.")
+
+                                # 1차 분석용 프롬프트 (문제점 탐지 중심 + 판례 법리 적용)
                                 theoretical_results = st.session_state.get('theoretical_results', None)
-                                first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results)
+                                first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results, precedents_content, legal_principles)
                                 
                                 # 🆕 Gemini 전송 프롬프트 디버깅 표시
-                                        
-                                        # 상위법령 내용 부분만 추출
-                                        if "상위법령들의 실제 조문 내용" in first_prompt:
-                                            law_start = first_prompt.find("상위법령들의 실제 조문 내용")
-                                            law_end = first_prompt.find("3. [검토 시 유의사항]")
-                                            if law_end == -1:
-                                                law_end = law_start + 5000  # 기본값
-                                            
-                                            law_content = first_prompt[law_start:law_end]
-                                            st.markdown(f"**상위법령 내용 길이**: {len(law_content):,}자")
-                                            
-                                            st.text_area(
-                                                "상위법령 관련 프롬프트 내용",
+
+                                # 상위법령 내용 부분만 추출
+                                if "상위법령들의 실제 조문 내용" in first_prompt:
+                                    law_start = first_prompt.find("상위법령들의 실제 조문 내용")
+                                    law_end = first_prompt.find("3. [검토 시 유의사항]")
+                                    if law_end == -1:
+                                        law_end = law_start + 5000  # 기본값
+
+                                    law_content = first_prompt[law_start:law_end]
+                                    st.markdown(f"**상위법령 내용 길이**: {len(law_content):,}자")
+
+                                    st.text_area(
+                                        "상위법령 관련 프롬프트 내용",
                                                 law_content[:3000] + "..." if len(law_content) > 3000 else law_content,
                                                 height=300,
                                                 key="prompt_law_content"
                                             )
-                                        
-                                        # 전체 프롬프트 표시 (처음 2000자만)
-                                        st.text_area(
-                                            "전체 프롬프트 (처음 2000자)",
-                                            first_prompt[:2000] + "..." if len(first_prompt) > 2000 else first_prompt,
-                                            height=400,
-                                            key="full_prompt"
-                                        )
+                                # 전체 프롬프트 표시 (처음 2000자만)
+                                st.text_area(
+                                    "전체 프롬프트 (처음 2000자)",
+                                    first_prompt[:2000] + "..." if len(first_prompt) > 2000 else first_prompt,
+                                    height=400,
+                                    key="full_prompt"
+                                )
                                 
                                 response = model.generate_content(first_prompt)
                                 
