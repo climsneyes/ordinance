@@ -387,7 +387,6 @@ def get_superior_law_content_xml(law_name):
         import xml.etree.ElementTree as ET
         import re
 
-        st.write(f"[DEBUG] 상위법령 조회 시작: {law_name}")
 
         # 검색어 최적화: 띄어쓰기와 특수문자 정리
         search_query = law_name.strip()
@@ -420,7 +419,6 @@ def get_superior_law_content_xml(law_name):
                         'id': law_id_elem.text,
                         'name': law_name_elem.text
                     })
-                    st.write(f"[DEBUG] 검색된 현행 법령: {law_name_elem.text}")
         
         if not current_laws:
             st.warning(f"[DEBUG] {law_name}의 현행 법령을 찾을 수 없음")
@@ -489,7 +487,6 @@ def get_superior_law_content_xml(law_name):
             if len(found_name) > 30:
                 score -= 30
                 
-            st.write(f"[DEBUG] 법령 평가: {found_name} = {score}점")
             
             if score > best_score:
                 best_score = score
@@ -498,12 +495,10 @@ def get_superior_law_content_xml(law_name):
         if best_law:
             law_id = best_law['id']
             exact_law_name = best_law['name']
-            st.write(f"[DEBUG] 최적 법령 선택: {exact_law_name} (ID: {law_id}, 점수: {best_score})")
         else:
             # 폴백: 첫 번째 법령
             law_id = current_laws[0]['id']
             exact_law_name = current_laws[0]['name']
-            st.write(f"[DEBUG] 기본 법령 선택: {exact_law_name} (ID: {law_id})")
         
         if not law_id:
             st.warning(f"[DEBUG] {law_name}의 현행 법령을 찾을 수 없음")
@@ -523,7 +518,6 @@ def get_superior_law_content_xml(law_name):
             return get_superior_law_content_xml_fallback(law_name)
         
         detail_root = ET.fromstring(detail_response.text)
-        st.write(f"[DEBUG] 상세 정보 로드 완료 ({len(detail_response.text):,} 문자)")
         
         # 3단계: 성공적인 추출 로직 적용 - 연결된 본문으로 처리
         upper_law_text = ""
@@ -548,7 +542,6 @@ def get_superior_law_content_xml(law_name):
                 upper_law_text += '        ' + content + '\n'
                 ho_count += 1
         
-        st.write(f"[DEBUG] 추출 통계: 조문내용 {jo_count}개, 항내용 {hang_count}개, 호내용 {ho_count}개")
         
         if upper_law_text.strip():
             # 스마트 필터링: 조례 관련 키워드가 포함된 부분 우선 추출
@@ -628,7 +621,6 @@ def get_superior_law_content_xml(law_name):
                 'content': truncated_text
             }
             
-            st.write(f"[DEBUG] 최종 결과: 연결된 본문 추출 완료, 총 {len(truncated_text):,}문자")
             return result
         else:
             st.warning("[DEBUG] 조문 내용이 비어있음")
@@ -800,7 +792,6 @@ def group_laws_by_hierarchy(superior_laws):
     for original in superior_laws:
         normalized = normalize_law_name(original)
         if normalized != original:
-            print(f"[DEBUG] 정규화: '{original}' -> '{normalized}'")
 
     # 2단계: 정규화된 법령명으로 그룹화
     for law_name in normalized_laws:
@@ -837,10 +828,6 @@ def get_all_superior_laws_content(superior_laws):
     # 1단계: 법령을 계층별로 그룹화
     law_groups = group_laws_by_hierarchy(superior_laws)
     
-    st.write(f"[DEBUG] 법령 그룹 분석:")
-    for base_name, laws in law_groups.items():
-        available = [k for k, v in laws.items() if v is not None]
-        st.write(f"  • {base_name}: {', '.join(available)}")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -909,7 +896,6 @@ def get_all_superior_laws_content(superior_laws):
         group['text_length'] = group_chars
         total_chars += group_chars
         
-        st.write(f"[DEBUG] {group.get('base_name', '알수없음')} 그룹: {group_chars:,}자")
     
     # 8만자를 초과하는 경우 경고만 표시하고 모든 내용 유지 (필터링 비활성화)
     if total_chars > max_chars:
@@ -1142,58 +1128,44 @@ def extract_legal_reasoning_from_analysis(analysis_text):
         extracted_context['reasoning'].extend(matches)
 
     # 5. 디버깅용 출력
-    print(f"[DEBUG] 추출된 법적 근거: {extracted_context['legal_basis']}")
-    print(f"[DEBUG] 추출된 핵심 개념: {len(extracted_context['key_concepts'])}개")
-    print(f"[DEBUG] 추출된 문제점: {len(extracted_context['problem_details'])}개")
 
     return extracted_context
 
 def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
     """쿼리와 관련된 가이드라인 검색 (Gemini 기반 또는 무료 버전)"""
     try:
-        print(f"[DEBUG] 검색 쿼리: '{query}'")
 
         if not vector_store or 'embeddings' not in vector_store:
-            print("[DEBUG] 벡터스토어가 없거나 embeddings 키가 없음")
             return []
 
-        print(f"[DEBUG] 벡터스토어 키: {list(vector_store.keys())}")
 
         # 벡터스토어 타입 확인 (Gemini 기반 vs 무료 버전)
         is_free_version = 'model_name' in vector_store and isinstance(vector_store['model_name'], str)
-        print(f"[DEBUG] 무료 버전 여부: {is_free_version}")
 
         if is_free_version:
             # 무료 sentence-transformers 기반 검색
             try:
                 from sentence_transformers import SentenceTransformer
-                print("[DEBUG] SentenceTransformer 모델 로딩...")
                 model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
                 query_embedding = model.encode([query])[0]
-                print(f"[DEBUG] 쿼리 임베딩 생성 완료, 차원: {len(query_embedding)}")
             except ImportError:
                 st.warning("sentence-transformers 라이브러리가 필요합니다.")
                 return []
         else:
             # Gemini 기반 검색
             if not api_key:
-                print("[DEBUG] Gemini API 키가 없음")
                 return []
             query_embedding = get_gemini_embedding(query, api_key)
             if not query_embedding:
-                print("[DEBUG] Gemini 임베딩 생성 실패")
                 return []
 
         # 코사인 유사도 계산
         query_embedding = np.array(query_embedding).reshape(1, -1)
-        print(f"[DEBUG] 저장된 임베딩 수: {len(vector_store['embeddings'])}")
         similarities = cosine_similarity(query_embedding, vector_store['embeddings'])[0]
-        print(f"[DEBUG] 유사도 계산 완료, 최고 유사도: {max(similarities):.4f}, 최저 유사도: {min(similarities):.4f}")
 
         # 최소 유사도 필터링 (기준 상향)
         min_similarity = 0.5 if is_free_version else 0.3  # 기준을 높여서 관련성 높은 결과만
         valid_indices = np.where(similarities >= min_similarity)[0]
-        print(f"[DEBUG] 최소 유사도 {min_similarity} 이상인 결과: {len(valid_indices)}개")
 
         # 추가적으로 키워드 기반 관련성 검사 (개선된 버전)
         keyword_filtered_indices = []
@@ -1212,30 +1184,22 @@ def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
                     # 조건 완화: 1개 이상의 키워드만 있어도 포함
                     if keyword_count >= 1:
                         keyword_filtered_indices.append(idx)
-                        print(f"[DEBUG] 키워드 매칭: {keyword_count}개 키워드, 한글 {korean_chars}개 - 포함")
                     else:
-                        print(f"[DEBUG] 키워드 부족: {keyword_count}개 키워드 - 제외")
                 else:
-                    print(f"[DEBUG] 한글 부족: {korean_chars}개 한글 - 제외")
 
             except Exception as e:
-                print(f"[DEBUG] 키워드 필터링 오류: {str(e)}")
                 continue
 
         if keyword_filtered_indices:
             valid_indices = np.array(keyword_filtered_indices)
-            print(f"[DEBUG] 키워드 필터링 후 결과: {len(valid_indices)}개")
         else:
-            print("[DEBUG] 키워드 필터링 결과가 없어 원래 결과 유지")
 
         if len(valid_indices) == 0:
-            print("[DEBUG] 유효한 결과가 없음")
             return []
 
         # 상위 k개 결과 선택
         valid_similarities = similarities[valid_indices]
         top_indices = valid_indices[np.argsort(valid_similarities)[-top_k:][::-1]]
-        print(f"[DEBUG] 선택된 상위 {len(top_indices)}개 결과의 유사도: {[similarities[i] for i in top_indices]}")
         
         relevant_chunks = []
         for idx in top_indices:
@@ -1243,14 +1207,12 @@ def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
 
             # 텍스트 품질 검사 및 필터링
             if not is_valid_text(original_text):
-                print(f"[DEBUG] 품질 불량으로 제외: {original_text[:50]}...")
                 continue
 
             # 텍스트 정제
             cleaned_text = clean_text_content(original_text)
 
             if len(cleaned_text.strip()) < 50:  # 너무 짧은 텍스트 제외
-                print(f"[DEBUG] 텍스트 길이 부족으로 제외: {cleaned_text[:50]}...")
                 continue
 
             relevant_chunks.append({
@@ -1416,7 +1378,6 @@ def analyze_ordinance_vs_superior_laws(pdf_text, superior_laws_content):
     if not superior_laws_content:
         return "상위법령 정보가 없어 직접 비교 분석을 수행할 수 없습니다."
     
-    st.write(f"[DEBUG] 계층별 상위법령 분석 시작 - {len(superior_laws_content)}개 법령 그룹")
     
     # 조례에서 사무 관련 조문 추출
     ordinance_provisions = []
@@ -2501,10 +2462,6 @@ def main():
                                 st.markdown(f"   **전체 조문 수**: {total_articles}개")
                                 
                                 # 🆕 상위법령 본문 내용 디버깅 표시
-                                if st.checkbox("🔍 Gemini가 참조할 상위법령 본문 내용 미리보기", key="debug_superior_content"):
-                                    with st.expander("📖 상위법령 전체 본문 내용", expanded=False):
-                                        for i, law_group in enumerate(superior_laws_content):
-                                            st.markdown(f"### [{i+1}] {law_group['base_name']}")
                                             
                                             # 연결된 본문이 있는 경우
                                             if 'combined_content' in law_group and law_group['combined_content']:
@@ -2569,7 +2526,6 @@ def main():
                                     st.error(f"상위법령 직접 비교 분석 중 오류: {str(e)}")
                                 
                                 # 상위법령 내용 미리보기 (계층별 그룹화)
-                                if st.checkbox("🔍 조회된 상위법령 내용 미리보기 (계층별)"):
                                     for law_group in superior_laws_content:
                                         base_name = law_group['base_name']
                                         
@@ -2634,10 +2590,6 @@ def main():
                                 first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results)
                                 
                                 # 🆕 Gemini 전송 프롬프트 디버깅 표시
-                                if st.checkbox("🔍 Gemini에게 전송되는 프롬프트 내용 확인", key="debug_gemini_prompt"):
-                                    with st.expander("📤 Gemini 전송 프롬프트", expanded=False):
-                                        st.markdown("### 프롬프트 구조 분석")
-                                        st.markdown(f"**전체 길이**: {len(first_prompt):,}자")
                                         
                                         # 상위법령 내용 부분만 추출
                                         if "상위법령들의 실제 조문 내용" in first_prompt:
