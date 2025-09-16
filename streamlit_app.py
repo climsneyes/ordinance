@@ -2888,11 +2888,12 @@ def main():
                                 # 🆕 2차 최종 분석용 프롬프트 (1차 분석 + 판례 법리 종합)
                                 st.info("📊 2차 최종 분석: 판례 법리 적용한 종합 위법성 판단 중...")
                                 theoretical_results = st.session_state.get('theoretical_results', None)
+                                guideline_results = st.session_state.get('guideline_results', None)
 
                                 # 기존 함수에 preliminary_analysis를 추가하여 사용
                                 final_prompt = create_analysis_prompt(
                                     pdf_text, search_results_for_analysis, superior_laws_content,
-                                    None, is_first_ordinance, comprehensive_analysis_results,
+                                    guideline_results, is_first_ordinance, comprehensive_analysis_results,
                                     theoretical_results, precedents_content, legal_principles
                                 )
 
@@ -2988,8 +2989,43 @@ def main():
                                                 
                                                 # 위법 판례를 포함한 재분석 프롬프트에 추가할 수 있도록 저장
                                                 st.session_state['theoretical_results'] = theoretical_results
+
+                                                # 🆕 통합 법령 문서(재의제소 + 자치법규입안가이드)에서 추가 검색
+                                                st.info("📖 통합 법령 문서에서 관련 가이드라인 검색 중...")
+                                                try:
+                                                    # 추출된 키워드로 통합 법령 문서 검색
+                                                    search_query = ' '.join(detected_problems[:3])  # 상위 3개 문제점
+                                                    guideline_results, loaded_stores = search_multiple_vectorstores(
+                                                        search_query,
+                                                        gemini_api_key,
+                                                        top_k_per_store=3
+                                                    )
+
+                                                    if guideline_results:
+                                                        st.success(f"✅ {len(guideline_results)}개의 관련 가이드라인을 찾았습니다!")
+
+                                                        with st.expander("📋 통합 법령 문서 검색 결과", expanded=False):
+                                                            for i, result in enumerate(guideline_results):
+                                                                st.markdown(f"**[{i+1}] {result.get('source_store', '알 수 없는 출처')}**")
+                                                                st.markdown(f"📊 **유사도**: {result.get('similarity', 0):.3f}")
+
+                                                                content_preview = result['text'][:400] + "..." if len(result['text']) > 400 else result['text']
+                                                                st.markdown(f"📄 **내용**: {content_preview}")
+                                                                st.markdown("---")
+
+                                                        # 세션에 저장
+                                                        st.session_state['guideline_results'] = guideline_results
+                                                    else:
+                                                        st.info("통합 법령 문서에서 관련 내용을 찾지 못했습니다.")
+                                                        st.session_state['guideline_results'] = []
+
+                                                except Exception as e:
+                                                    st.warning(f"통합 법령 문서 검색 중 오류: {str(e)}")
+                                                    st.session_state['guideline_results'] = []
+
                                             else:
                                                 st.warning("관련 위법 판례를 찾지 못했습니다.")
+                                                st.session_state['guideline_results'] = []
 
                                         except Exception as e:
                                             st.error(f"위법 판례 검색 중 오류: {str(e)}")
@@ -3302,9 +3338,11 @@ def main():
                         if analysis_results:
                             # 🆕 분석 결과를 세션 상태에 저장
                             st.session_state.analysis_results = analysis_results
+                            # 통합 법령 문서 결과도 metadata에 포함
+                            final_guideline_results = st.session_state.get('guideline_results', relevant_guidelines)
                             st.session_state.analysis_metadata = {
                                 'has_problems': has_problems,
-                                'relevant_guidelines': relevant_guidelines,
+                                'relevant_guidelines': final_guideline_results,
                                 'loaded_stores': loaded_stores,
                                 'is_first_ordinance': is_first_ordinance,
                                 'superior_laws_content': superior_laws_content,

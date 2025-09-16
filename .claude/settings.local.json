@@ -18,7 +18,8 @@
       "Bash(git branch:*)",
       "Bash(git push:*)",
       "Bash(tail:*)",
-      "Bash(git rm:*)"
+      "Bash(git rm:*)",
+      "WebFetch(domain:www.data.go.kr)"
     ],
     "deny": [],
     "ask": []
