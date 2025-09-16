@@ -1161,8 +1161,9 @@ def search_precedents(query_keywords, max_results=10):
         root = ET.fromstring(response.text)
         precedents = []
 
-        # XML 응답 파싱
-        for prec_elem in root.findall('.//PrecSearch'):
+        # 🆕 XML 응답 파싱 (올바른 구조 사용)
+        # 루트가 PrecSearch이므로, prec 태그를 직접 찾음
+        for prec_elem in root.findall('prec'):
             try:
                 prec_id = prec_elem.find('판례일련번호')
                 case_name = prec_elem.find('사건명')
