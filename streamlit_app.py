@@ -2880,58 +2880,10 @@ def main():
                                     with st.expander("🔍 1차 예비 분석 결과 보기"):
                                         st.markdown(preliminary_analysis[:1500] + "..." if len(preliminary_analysis) > 1500 else preliminary_analysis)
 
-                                # 🆕 추출된 키워드로 판례 검색
-                                st.info("⚖️ 관련 판례 검색 중...")
+                                # 판례 검색은 PKL 분석 이후로 이동
                                 precedents = []
                                 precedents_content = []
                                 legal_principles = []
-
-                                if legality_keywords:
-                                    st.info(f"🔎 검색 키워드: {', '.join(legality_keywords)}")
-
-                                    # 위법성 키워드로 판례 검색
-                                    search_query = ' '.join(legality_keywords[:3])  # 상위 3개 키워드
-                                    precedents = search_precedents(search_query, max_results=5)
-                                else:
-                                    st.warning("위법성 키워드를 추출할 수 없어 기본 키워드로 검색합니다.")
-                                    # 폴백: 조례 제목에서 키워드 추출
-                                    fallback_keywords = []
-                                    if pdf_text:
-                                        title_match = re.search(r'[가-힣\s]{5,30}(?:조례|규칙)', pdf_text[:200])
-                                        if title_match:
-                                            title = title_match.group()
-                                            keywords = re.findall(r'[가-힣]{2,6}', title)
-                                            fallback_keywords = keywords[:3]
-
-                                    if fallback_keywords:
-                                        search_query = ' '.join(fallback_keywords)
-                                        precedents = search_precedents(search_query, max_results=5)
-
-                                    if precedents:
-                                        st.success(f"📋 {len(precedents)}개 판례 검색 완료")
-
-                                        # 판례 상세 내용 가져오기
-                                        progress_bar = st.progress(0)
-                                        for i, precedent in enumerate(precedents[:3]):  # 최대 3개만 상세 조회
-                                            detail_content = get_precedent_detail(precedent['id'])
-                                            if detail_content:
-                                                precedent['content'] = detail_content
-                                                precedents_content.append(precedent)
-                                            progress_bar.progress((i+1) / min(len(precedents), 3))
-
-                                        # 판례에서 법리 추출
-                                        if precedents_content:
-                                            contents_only = [p.get('content', '') for p in precedents_content]
-                                            legal_principles = extract_legal_principles_from_precedents(contents_only)
-
-                                            if legal_principles:
-                                                st.success(f"⚖️ {len(legal_principles)}개 법리 추출 완료")
-                                            else:
-                                                st.info("법리 추출 결과가 없습니다.")
-                                    else:
-                                        st.info("관련 판례를 찾을 수 없습니다.")
-                                else:
-                                    st.info("검색 키워드를 추출할 수 없어 판례 검색을 생략합니다.")
 
                                 # 🆕 2차 최종 분석용 프롬프트 (1차 분석 + 판례 법리 종합)
                                 st.info("📊 2차 최종 분석: 판례 법리 적용한 종합 위법성 판단 중...")
@@ -3042,6 +2994,68 @@ def main():
                                         except Exception as e:
                                             st.error(f"위법 판례 검색 중 오류: {str(e)}")
                                             st.session_state['theoretical_results'] = None
+
+                                        # 🆕 PKL 분석 완료 후 추출된 키워드로 판례 검색
+                                        st.info("⚖️ 3단계: 국가법령정보센터에서 관련 판례 검색 중...")
+
+                                        if legality_keywords:
+                                            st.info(f"🔎 검색 키워드: {', '.join(legality_keywords)}")
+
+                                            # 위법성 키워드로 판례 검색
+                                            search_query = ' '.join(legality_keywords[:3])  # 상위 3개 키워드
+                                            precedents = search_precedents(search_query, max_results=5)
+
+                                            if precedents:
+                                                st.success(f"📋 {len(precedents)}개 판례 검색 완료")
+
+                                                # 판례 상세 내용 가져오기
+                                                progress_bar = st.progress(0)
+                                                for i, precedent in enumerate(precedents[:3]):  # 최대 3개만 상세 조회
+                                                    detail_content = get_precedent_detail(precedent['id'])
+                                                    if detail_content:
+                                                        precedent['content'] = detail_content
+                                                        precedents_content.append(precedent)
+                                                    progress_bar.progress((i+1) / min(len(precedents), 3))
+
+                                                # 판례에서 법리 추출
+                                                if precedents_content:
+                                                    contents_only = [p.get('content', '') for p in precedents_content]
+                                                    legal_principles = extract_legal_principles_from_precedents(contents_only)
+
+                                                    if legal_principles:
+                                                        st.success(f"⚖️ {len(legal_principles)}개 법리 추출 완료")
+                                                        with st.expander("📖 추출된 법리 보기"):
+                                                            for i, principle in enumerate(legal_principles):
+                                                                st.markdown(f"{i+1}. {principle}")
+                                                    else:
+                                                        st.info("법리 추출 결과가 없습니다.")
+                                            else:
+                                                st.info("관련 판례를 찾을 수 없습니다.")
+                                        else:
+                                            st.warning("위법성 키워드를 추출할 수 없어 기본 키워드로 검색합니다.")
+                                            # 폴백: 조례 제목에서 키워드 추출
+                                            fallback_keywords = []
+                                            if pdf_text:
+                                                title_match = re.search(r'[가-힣\s]{5,30}(?:조례|규칙)', pdf_text[:200])
+                                                if title_match:
+                                                    title = title_match.group()
+                                                    keywords = re.findall(r'[가-힣]{2,6}', title)
+                                                    fallback_keywords = keywords[:3]
+
+                                            if fallback_keywords:
+                                                search_query = ' '.join(fallback_keywords)
+                                                precedents = search_precedents(search_query, max_results=3)
+
+                                                if precedents:
+                                                    st.success(f"📋 {len(precedents)}개 판례 검색 완료 (폴백)")
+                                                    # 간단한 상세 조회
+                                                    for precedent in precedents[:2]:
+                                                        detail_content = get_precedent_detail(precedent['id'])
+                                                        if detail_content:
+                                                            precedent['content'] = detail_content
+                                                            precedents_content.append(precedent)
+                                                else:
+                                                    st.info("폴백 키워드로도 판례를 찾을 수 없습니다.")
                                     else:
                                         st.success("✅ Gemini 1차 분석에서 특별한 문제점이 발견되지 않았습니다.")
                                         
