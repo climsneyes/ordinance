@@ -1432,6 +1432,110 @@ def search_multiple_vectorstores(query, api_key=None, top_k_per_store=2):
         st.error(f"복합 벡터스토어 검색 오류: {str(e)}")
         return [], []
 
+def extract_legality_keywords_from_analysis(analysis_result, api_key):
+    """Gemini 1차 분석 결과에서 위법성 의심 키워드 추출"""
+    try:
+        if not analysis_result or not api_key:
+            return []
+
+        # 키워드 추출을 위한 프롬프트
+        keyword_extraction_prompt = f"""
+다음은 조례 위법성 분석 결과입니다. 이 분석 결과에서 판례 검색에 유용한 핵심 키워드를 추출해주세요.
+
+**분석 결과**:
+{analysis_result[:2000]}  # 토큰 제한을 위해 앞부분만
+
+**추출 조건**:
+1. 위법성이 의심되는 구체적인 법적 쟁점 키워드 (예: "기관위임사무", "법정위임한계", "포괄위임금지원칙")
+2. 관련 법령이나 제도 키워드 (예: "건축허가", "개발행위허가", "환경영향평가")
+3. 판례에서 다뤄질 가능성이 높은 키워드 우선
+
+**출력 형식**: 키워드1, 키워드2, 키워드3 (최대 5개, 쉼표로 구분)
+
+키워드:"""
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash-lite')
+
+        response = model.generate_content(keyword_extraction_prompt)
+
+        if response and hasattr(response, 'text') and response.text:
+            # 키워드 파싱
+            keywords_text = response.text.strip()
+            # "키워드:" 이후 텍스트 추출
+            if "키워드:" in keywords_text:
+                keywords_text = keywords_text.split("키워드:")[-1].strip()
+
+            # 쉼표로 분리하고 정리
+            keywords = [kw.strip() for kw in keywords_text.split(',') if kw.strip()]
+            # 불필요한 문자 제거
+            cleaned_keywords = []
+            for kw in keywords[:5]:  # 최대 5개
+                clean_kw = re.sub(r'[^\w가-힣\s]', '', kw).strip()
+                if len(clean_kw) >= 2 and clean_kw not in cleaned_keywords:
+                    cleaned_keywords.append(clean_kw)
+
+            return cleaned_keywords
+
+        return []
+
+    except Exception as e:
+        st.warning(f"키워드 추출 오류: {str(e)}")
+        return []
+
+def perform_preliminary_analysis(pdf_text, superior_laws_content, search_results, api_key):
+    """1차 예비 분석 수행 - 위법성 의심 사유 파악"""
+    try:
+        if not api_key:
+            return None, []
+
+        # 1차 분석용 간단한 프롬프트 (판례 없이)
+        preliminary_prompt = f"""
+다음 조례를 분석하여 위법성이 의심되는 핵심 쟁점을 파악해주세요.
+
+**조례 내용**:
+{pdf_text[:3000]}
+
+**상위법령 정보**:
+{str(superior_laws_content)[:2000] if superior_laws_content else '없음'}
+
+**관련 가이드라인**:
+{str(search_results)[:1000] if search_results else '없음'}
+
+**분석 요청**:
+1. 가장 심각한 위법성 의심 사유 3개를 간략히 제시
+2. 각 사유별로 관련 법적 쟁점 키워드 제시
+3. 판례 검색이 필요한 핵심 키워드 추출
+
+**출력 형식**:
+## 위법성 의심 사유
+1. [사유1]: [구체적 내용]
+2. [사유2]: [구체적 내용]
+3. [사유3]: [구체적 내용]
+
+## 판례 검색 키워드
+[키워드1, 키워드2, 키워드3, 키워드4, 키워드5]
+"""
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash-lite')
+
+        response = model.generate_content(preliminary_prompt)
+
+        if response and hasattr(response, 'text') and response.text:
+            analysis_text = response.text
+
+            # 키워드 추출
+            keywords = extract_legality_keywords_from_analysis(analysis_text, api_key)
+
+            return analysis_text, keywords
+
+        return None, []
+
+    except Exception as e:
+        st.error(f"1차 예비 분석 오류: {str(e)}")
+        return None, []
+
 def detect_agency_delegation(superior_article: Dict, ordinance_article: Dict, source_type: str) -> Dict:
     """기관위임사무 특화 판별 함수"""
     
@@ -2765,38 +2869,43 @@ def main():
                                 genai.configure(api_key=gemini_api_key)
                                 model = genai.GenerativeModel('gemini-2.0-flash-lite')
                                 
-                                # 🆕 판례 검색 및 법리 추출
-                                st.info("🔍 관련 판례 검색 중...")
+                                # 🆕 1차 예비 분석으로 위법성 의심 키워드 추출
+                                st.info("🔍 1차 예비 분석: 위법성 의심 사유 파악 중...")
+                                preliminary_analysis, legality_keywords = perform_preliminary_analysis(
+                                    pdf_text, superior_laws_content, search_results_for_analysis, gemini_api_key
+                                )
 
-                                # 조례 제목에서 검색 키워드 추출
-                                ordinance_keywords = []
-                                if pdf_text:
-                                    # 조례 제목 추출 시도
-                                    title_match = re.search(r'(?:조례|규칙)\s*$|(?:조례|규칙)\s*[제정|개정|폐지]', pdf_text[:200])
-                                    if title_match:
-                                        title_area = pdf_text[:title_match.end()]
-                                        # 핵심 키워드 추출
-                                        keywords = re.findall(r'[가-힣]{2,6}(?:조례|규칙|관리|지원|운영|설치|위원회)', title_area)
-                                        ordinance_keywords.extend(keywords[:3])
+                                if preliminary_analysis:
+                                    st.success("✅ 1차 예비 분석 완료")
+                                    with st.expander("🔍 1차 예비 분석 결과 보기"):
+                                        st.markdown(preliminary_analysis[:1500] + "..." if len(preliminary_analysis) > 1500 else preliminary_analysis)
 
-                                # 상위법령명에서도 키워드 추출
-                                if superior_laws_content:
-                                    for law_group in superior_laws_content[:2]:
-                                        law_name = law_group.get('base_name', '')
-                                        law_keywords = re.findall(r'[가-힣]{2,8}(?:법|령)', law_name)
-                                        ordinance_keywords.extend(law_keywords[:2])
-
-                                # 중복 제거 및 최종 키워드 선정
-                                unique_keywords = list(set(ordinance_keywords))[:3]
-
-                                # 판례 검색 실행
+                                # 🆕 추출된 키워드로 판례 검색
+                                st.info("⚖️ 관련 판례 검색 중...")
                                 precedents = []
                                 precedents_content = []
                                 legal_principles = []
 
-                                if unique_keywords:
-                                    search_query = ' '.join(unique_keywords)
+                                if legality_keywords:
+                                    st.info(f"🔎 검색 키워드: {', '.join(legality_keywords)}")
+
+                                    # 위법성 키워드로 판례 검색
+                                    search_query = ' '.join(legality_keywords[:3])  # 상위 3개 키워드
                                     precedents = search_precedents(search_query, max_results=5)
+                                else:
+                                    st.warning("위법성 키워드를 추출할 수 없어 기본 키워드로 검색합니다.")
+                                    # 폴백: 조례 제목에서 키워드 추출
+                                    fallback_keywords = []
+                                    if pdf_text:
+                                        title_match = re.search(r'[가-힣\s]{5,30}(?:조례|규칙)', pdf_text[:200])
+                                        if title_match:
+                                            title = title_match.group()
+                                            keywords = re.findall(r'[가-힣]{2,6}', title)
+                                            fallback_keywords = keywords[:3]
+
+                                    if fallback_keywords:
+                                        search_query = ' '.join(fallback_keywords)
+                                        precedents = search_precedents(search_query, max_results=5)
 
                                     if precedents:
                                         st.success(f"📋 {len(precedents)}개 판례 검색 완료")
@@ -2824,20 +2933,39 @@ def main():
                                 else:
                                     st.info("검색 키워드를 추출할 수 없어 판례 검색을 생략합니다.")
 
-                                # 1차 분석용 프롬프트 (문제점 탐지 중심 + 판례 법리 적용)
+                                # 🆕 2차 최종 분석용 프롬프트 (1차 분석 + 판례 법리 종합)
+                                st.info("📊 2차 최종 분석: 판례 법리 적용한 종합 위법성 판단 중...")
                                 theoretical_results = st.session_state.get('theoretical_results', None)
-                                first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results, precedents_content, legal_principles)
+
+                                # 기존 함수에 preliminary_analysis를 추가하여 사용
+                                final_prompt = create_analysis_prompt(
+                                    pdf_text, search_results_for_analysis, superior_laws_content,
+                                    None, is_first_ordinance, comprehensive_analysis_results,
+                                    theoretical_results, precedents_content, legal_principles
+                                )
+
+                                # 1차 예비 분석 결과를 최종 프롬프트에 추가
+                                if preliminary_analysis:
+                                    final_prompt = (
+                                        "**🔍 1차 예비 분석 결과**\n"
+                                        "다음은 위법성 의심 사유를 파악한 1차 예비 분석 결과이다.\n"
+                                        "이 결과를 바탕으로 더 정확하고 구체적인 위법성 분석을 수행하라.\n"
+                                        "---\n" +
+                                        preliminary_analysis +
+                                        "\n---\n\n" +
+                                        final_prompt
+                                    )
                                 
                                 # 🆕 Gemini 전송 프롬프트 디버깅 표시
 
                                 # 상위법령 내용 부분만 추출
-                                if "상위법령들의 실제 조문 내용" in first_prompt:
-                                    law_start = first_prompt.find("상위법령들의 실제 조문 내용")
-                                    law_end = first_prompt.find("3. [검토 시 유의사항]")
+                                if "상위법령들의 실제 조문 내용" in final_prompt:
+                                    law_start = final_prompt.find("상위법령들의 실제 조문 내용")
+                                    law_end = final_prompt.find("3. [검토 시 유의사항]")
                                     if law_end == -1:
                                         law_end = law_start + 5000  # 기본값
 
-                                    law_content = first_prompt[law_start:law_end]
+                                    law_content = final_prompt[law_start:law_end]
                                     st.markdown(f"**상위법령 내용 길이**: {len(law_content):,}자")
 
                                     st.text_area(
@@ -2848,13 +2976,13 @@ def main():
                                             )
                                 # 전체 프롬프트 표시 (처음 2000자만)
                                 st.text_area(
-                                    "전체 프롬프트 (처음 2000자)",
-                                    first_prompt[:2000] + "..." if len(first_prompt) > 2000 else first_prompt,
+                                    "최종 프롬프트 (처음 2000자)",
+                                    final_prompt[:2000] + "..." if len(final_prompt) > 2000 else final_prompt,
                                     height=400,
-                                    key="full_prompt"
+                                    key="final_prompt"
                                 )
-                                
-                                response = model.generate_content(first_prompt)
+
+                                response = model.generate_content(final_prompt)
                                 
                                 if response and hasattr(response, 'text') and response.text:
                                     first_analysis = response.text
