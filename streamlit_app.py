@@ -1136,11 +1136,9 @@ def extract_legal_reasoning_from_analysis(analysis_text):
 def search_precedents(query_keywords, max_results=10):
     """국가법령정보센터 API를 통한 판례 검색"""
     try:
-        # 검색 키워드 최적화
-        if isinstance(query_keywords, list):
-            search_query = ' '.join(query_keywords[:3])  # 최대 3개 키워드
-        else:
-            search_query = query_keywords
+        # 🆕 검색 키워드 최적화 ('조례' 단독 검색 우선)
+        # 먼저 '조례'만으로 검색을 시도하고, 필요시 개별 키워드 추가 검색
+        search_query = "조례"
 
         # API 요청 파라미터
         params = {
@@ -1185,6 +1183,69 @@ def search_precedents(query_keywords, max_results=10):
                 continue
 
         st.success(f"📋 {len(precedents)}개의 관련 판례를 발견했습니다.")
+
+        # 🆕 추가 키워드별 검색 (OR 방식 구현)
+        if isinstance(query_keywords, list) and len(query_keywords) > 0:
+            st.info("🔄 각 키워드별로 관련 판례를 추가 검색합니다...")
+
+            # 각 키워드별로 개별 검색 수행
+            additional_precedents = []
+            search_keywords = [k for k in query_keywords[:3] if k.strip()]  # 빈 문자열 제거
+
+            for keyword in search_keywords:
+                try:
+                    # '조례 + 키워드' 조합으로 검색
+                    combined_query = f"조례 {keyword}"
+                    st.info(f"🔍 키워드별 검색: '{combined_query}'")
+
+                    keyword_params = params.copy()
+                    keyword_params['query'] = combined_query
+                    keyword_params['display'] = 3  # 각 키워드당 3개씩
+
+                    keyword_response = requests.get(precedent_search_url, params=keyword_params, timeout=15)
+                    if keyword_response.status_code == 200:
+                        keyword_root = ET.fromstring(keyword_response.text)
+                        keyword_precs = keyword_root.findall('prec')
+
+                        st.info(f"   → '{keyword}' 키워드로 {len(keyword_precs)}개 판례 발견")
+
+                        for prec_elem in keyword_precs:
+                            try:
+                                prec_id = prec_elem.find('판례일련번호')
+                                case_name = prec_elem.find('사건명')
+
+                                if prec_id is not None and case_name is not None:
+                                    # 중복 제거
+                                    all_existing_ids = [p['id'] for p in precedents + additional_precedents]
+
+                                    if prec_id.text not in all_existing_ids:
+                                        court = prec_elem.find('법원명')
+                                        date = prec_elem.find('선고일자')
+                                        case_type = prec_elem.find('사건종류명')
+
+                                        additional_precedent = {
+                                            'id': prec_id.text,
+                                            'case_name': case_name.text,
+                                            'court': court.text if court is not None else '',
+                                            'date': date.text if date is not None else '',
+                                            'case_type': case_type.text if case_type is not None else '',
+                                            'summary': ''
+                                        }
+                                        additional_precedents.append(additional_precedent)
+
+                            except Exception as e:
+                                continue
+
+                except Exception as e:
+                    st.warning(f"키워드 '{keyword}' 검색 중 오류: {str(e)}")
+                    continue
+
+            if additional_precedents:
+                st.success(f"✅ 추가로 {len(additional_precedents)}개의 판례를 더 발견했습니다!")
+                precedents.extend(additional_precedents)
+            else:
+                st.info("추가 검색에서는 새로운 판례를 찾지 못했습니다.")
+
         return precedents[:max_results]
 
     except Exception as e:
