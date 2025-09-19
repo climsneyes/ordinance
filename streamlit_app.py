@@ -1815,15 +1815,23 @@ def analyze_ordinance_vs_superior_laws(pdf_text, superior_laws_content):
 def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None, relevant_guidelines=None, is_first_ordinance=False, comprehensive_analysis_results=None, theoretical_results=None, precedents_content=None, legal_principles=None):
     """분석 프롬프트 생성 함수"""
     prompt = (
-        "🚨 **중요 미션: 실제 위법 내용 찾기**\n"
-        "너는 조례 위법성 전문 검토관이다. 일반적인 법리 설명이 아니라 **구체적인 위법 사항을 찾아내는 것**이 목표다.\n"
-        "상위법령과 조례를 조문 대 조문으로 직접 비교하여 실제 충돌하는 부분을 찾아라.\n\n"
-        "**검토 원칙:**\n"
-        "- ❌ '이런 내용이 있으면 위법하다'는 일반론 금지\n"
-        "- ✅ '조례 제3조는 도로교통법 제12조와 이렇게 충돌한다'는 구체적 지적 필수\n"
-        "- ✅ 의심스러운 부분도 반드시 언급\n"
-        "- ✅ 위법이 없으면 '위법 사항 없음'으로 명확히 결론\n\n"
-        "아래는 내가 업로드한 조례 PDF의 전체 내용이야.\n"
+        "🚨 **핵심 미션: 근거 기반 위법성 판정**\n"
+        "너는 조례 위법성 전문 검토관이다. 제공된 **구체적 근거 자료들을 활용하여** 위법 여부를 판정하는 것이 목표다.\n\n"
+
+        "**🔍 분석 방법론:**\n"
+        "1. **PKL 검색 결과 활용**: 제공된 위법 판례와 현재 조례의 유사성 분석\n"
+        "2. **판례 검색 결과 활용**: 국가법령정보센터에서 검색된 관련 판례의 법리 적용\n"
+        "3. **상위법령 직접 비교**: 조례 조문과 상위법령 조문의 구체적 대조 분석\n"
+        "4. **가이드라인 참조**: 자치법규 작성 가이드라인의 검토 기준 적용\n\n"
+
+        "**📋 작성 원칙:**\n"
+        "- ❌ 금지: '~하다면 위법이다', '~할 경우 문제가 된다' 등의 가정적 표현\n"
+        "- ✅ 필수: '조례 제○조 \"(조문 인용)\"는 ○○법 제○조 \"(조문 인용)\"와 다음과 같이 충돌한다'\n"
+        "- ✅ 필수: PKL/판례 검색 결과에서 발견된 유사 사례와 현재 조례의 구체적 비교\n"
+        "- ✅ 필수: 검색된 관련 판례의 법리를 현재 조례에 직접 적용한 분석\n"
+        "- ✅ 필수: 위법이 없으면 '검토 결과 위법 사항 없음'으로 명확히 결론\n\n"
+
+        "**📄 현재 검토 대상 조례 전문:**\n"
         "---\n"
         f"{pdf_text}\n"
         "---\n"
@@ -1885,9 +1893,10 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
     
     # 자치법규 가이드라인 및 사례 추가
     if relevant_guidelines:
-        prompt += "\n그리고 아래는 자치법규 관련 자료에서 검색된 관련 내용이야.\n"
-        prompt += "**중요**: 소관사무의 원칙, 법률유보의 원칙, 법령우위의 원칙 등 부분에 있어 조금이라도 문제가 될 것 같은 부분이 있다면,\n"
-        prompt += "아래 자료에 수록된 예전에 문제가 되었던 사례와 검토 기준을 자세히 참조해서 보고서를 작성해줘.\n"
+        prompt += "\n**📋 통합 법령 문서 검색 결과 (재의제소 + 자치법규입안가이드)**\n"
+        prompt += "자치법규 작성 가이드라인과 과거 문제 사례들이다.\n"
+        prompt += "**분석 방법**: 아래 가이드라인과 사례를 현재 조례와 직접 비교하여 위법 여부를 판정하라.\n"
+        prompt += "'가이드라인에서 ○○는 금지한다고 했는데, 현재 조례 제○조가 이에 해당한다' 식으로 구체적 지적하라.\n"
         prompt += "---\n"
         
         # 소스별로 그룹화하여 표시
@@ -1909,9 +1918,10 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
     # 종합 위법성 판례 분석 결과 추가
     if comprehensive_analysis_results and isinstance(comprehensive_analysis_results, list) and len(comprehensive_analysis_results) > 0:
         total_risks = sum(len(result['violation_risks']) for result in comprehensive_analysis_results)
-        prompt += f"\n**🚨 중요: 종합 조례 위법성 판례 적용 결과 ({total_risks}개 위험)**\n"
-        prompt += "PKL 파일에서 검색된 실제 조례 위법 판례들(기관위임사무, 상위법령 위배, 법률유보 위배, 권한배분 위배 등)을\n"
-        prompt += "현재 조례에 직접 적용한 분석 결과이다. 이 결과를 바탕으로 각 유형별 위법성을 정확히 판단하고 구체적인 개선방안을 제시해줘.\n"
+        prompt += f"\n**📊 PKL 검색 결과 기반 분석 ({total_risks}개 위험 발견)**\n"
+        prompt += "아래는 PKL 파일에서 검색된 실제 조례 위법 판례들을 현재 조례에 적용한 분석 결과이다.\n"
+        prompt += "**중요**: 각 판례의 위법 사유와 현재 조례 조문을 직접 비교하여 위법 여부를 구체적으로 판정하라.\n"
+        prompt += "단순히 '유사하므로 위법 가능성이 있다'가 아니라, '어떤 부분이 어떻게 위법인지' 명확히 지적하라.\n"
         prompt += "---\n"
         
         for result in comprehensive_analysis_results:
@@ -1932,9 +1942,10 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
 
     # 🆕 검색된 관련 판례/이론 추가
     if theoretical_results and isinstance(theoretical_results, list) and len(theoretical_results) > 0:
-        prompt += f"\n**📚 중요: 발견된 문제점 관련 판례/이론 ({len(theoretical_results)}개)**\n"
-        prompt += "이는 1차 분석에서 발견된 문제점들과 직접 관련된 판례와 법리이다.\n"
-        prompt += "아래 판례들을 참고하여 현재 조례의 위법성을 정확히 판단하고 구체적인 개선방안을 제시해줘.\n"
+        prompt += f"\n**📚 PKL 추가 검색 결과 분석 ({len(theoretical_results)}개 관련 자료)**\n"
+        prompt += "1차 분석에서 발견된 문제점들과 관련된 추가 판례와 법리이다.\n"
+        prompt += "**분석 방법**: 각 자료의 내용과 현재 조례를 구체적으로 대조하여 위법 여부를 판정하라.\n"
+        prompt += "가설이나 추정이 아닌, 실제 조문 비교를 통한 명확한 결론을 제시하라.\n"
         prompt += "---\n"
 
         for i, theory in enumerate(theoretical_results[:5]):  # 상위 5개만 포함
@@ -1956,8 +1967,9 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
 
     # 판례 검색 결과 추가
     if precedents_content and len(precedents_content) > 0:
-        prompt += f"\n**⚖️ 관련 판례 검토 결과 ({len(precedents_content)}개)**\n"
-        prompt += "아래는 조례와 관련된 쟁점에 대한 판례들이다. 이 판례들의 법리를 현재 조례에 적용하여 위법성을 판단해줘.\n"
+        prompt += f"\n**⚖️ 국가법령정보센터 판례 검색 결과 ({len(precedents_content)}개)**\n"
+        prompt += "조례 관련 쟁점에 대한 판례들이다. **중요**: 각 판례의 법리를 현재 조례의 구체적 조문에 적용하라.\n"
+        prompt += "**분석 방법**: '판례에서 ○○는 위법하다고 했는데, 현재 조례 제○조도 동일한 내용이므로 위법이다' 식으로 구체적 비교하라.\n"
         prompt += "---\n"
 
         for i, precedent in enumerate(precedents_content[:3]):  # 최대 3개 판례
@@ -2006,14 +2018,26 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
     
     prompt += (
         "---\n"
-        "아래 기준에 따라 분석해줘. 반드시 한글로 답변해줘.\n"
-        "1. [비교분석 요약표(조문별)]\n"
+        "**🎯 최종 분석 지시사항**\n"
+        "위에 제공된 모든 검색 결과(PKL, 판례, 가이드라인, 상위법령)를 종합하여 다음과 같이 분석하라.\n\n"
+
+        "**📊 분석 방법론:**\n"
+        "1. **근거 자료 우선**: 검색된 판례와 가이드라인을 구체적 근거로 활용\n"
+        "2. **조문 대조**: 현재 조례 조문과 상위법령/판례를 직접 비교\n"
+        "3. **명확한 결론**: '위법 사항 있음' 또는 '위법 사항 없음'으로 명확히 결론\n"
+        "4. **구체적 지적**: 가설이 아닌 실제 비교를 통한 위법 지적\n\n"
+
+        "이제 아래 기준에 따라 분석해줘. 반드시 한글로 답변해줘.\n"
+        "1. [근거 기반 위법성 분석]\n"
+        "- 위에 제공된 PKL 검색 결과, 판례 검색 결과, 가이드라인을 활용한 구체적 분석\n"
+        "- '○○ 판례에서 금지한 ○○○가 현재 조례 제○조에 동일하게 나타남' 식으로 구체적 지적\n\n"
+        "2. [비교분석 요약표(조문별)]\n"
         "- 표의 컬럼: 조문(내 조례), 주요 내용, 타 시도 유사 조항, 동일 여부, 차이 및 내 조례 특징, 추천 조문\n"
         "- 반드시 내 조례(PDF로 업로드한 조례)의 조문만을 기준으로, 각 조문별로 타 시도 조례와 비교해 표로 정리(내 조례에 없는 조문은 비교하지 말 것)\n"
         "- '추천 조문' 칸에는 타 시도 조례와 비교해 무난하게 생각되는 조문 예시를 한글로 작성\n\n"
-        "2. [내 조례의 차별점 요약] (별도 소제목)\n"
+        "3. [내 조례의 차별점 요약] (별도 소제목)\n"
         "- 타 시도 조례와 비교해 독특하거나 구조적으로 다른 점, 내 조례만의 관리/운영 방식 등 요약\n\n"
-        "3. [검토 시 유의사항] (별도 소제목)\n"
+        "4. [검토 시 유의사항] (별도 소제목)\n"
         "각 항목마다 일반인도 이해할 수 있도록 쉬운 말로 부연설명도 함께 작성해줘.\n"
         "다음 원칙들을 기준으로 검토해줘:\n"
         "a) 소관사무의 원칙 - **🚨 매우 중요: 기관위임사무는 조례 제정 금지**\n"
