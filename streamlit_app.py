@@ -1136,9 +1136,34 @@ def extract_legal_reasoning_from_analysis(analysis_text):
 def search_precedents(query_keywords, max_results=10):
     """국가법령정보센터 API를 통한 판례 검색"""
     try:
-        # 🆕 검색 키워드 최적화 ('조례' 단독 검색 우선)
-        # 먼저 '조례'만으로 검색을 시도하고, 필요시 개별 키워드 추가 검색
-        search_query = "조례"
+        # 🆕 검색 키워드 최적화 (API에서 잘 검색되는 키워드 사용)
+        # API 테스트 결과를 바탕으로 실제로 검색 결과가 나오는 키워드 우선 사용
+        if isinstance(query_keywords, list) and len(query_keywords) > 0:
+            # 조례 관련 위법성 키워드로 변환
+            effective_keywords = []
+
+            for keyword in query_keywords:
+                if keyword in ['기관위임사무', '위임사무']:
+                    effective_keywords.append('위임범위초과')
+                elif keyword in ['자치사무', '사무']:
+                    effective_keywords.append('조례 취소')
+                elif keyword in ['위법', '위반']:
+                    effective_keywords.append('조례 무효')
+                elif keyword in ['권한', '허가']:
+                    effective_keywords.append('포괄위임금지')
+                else:
+                    effective_keywords.append(keyword)
+
+            # 가장 효과적인 키워드 선택 (API 테스트에서 많은 결과가 나온 것 우선)
+            priority_keywords = ['조례 무효', '조례안', '조례 취소', '위임범위초과', '포괄위임금지']
+
+            search_query = "조례"  # 기본값
+            for priority in priority_keywords:
+                if any(word in priority for word in effective_keywords):
+                    search_query = priority
+                    break
+        else:
+            search_query = "조례"
 
         # API 요청 파라미터
         params = {
@@ -1184,22 +1209,21 @@ def search_precedents(query_keywords, max_results=10):
 
         st.success(f"📋 {len(precedents)}개의 관련 판례를 발견했습니다.")
 
-        # 🆕 추가 키워드별 검색 (OR 방식 구현)
+        # 🆕 추가 키워드별 검색 (API에서 잘 검색되는 키워드 사용)
         if isinstance(query_keywords, list) and len(query_keywords) > 0:
-            st.info("🔄 각 키워드별로 관련 판례를 추가 검색합니다...")
+            st.info("🔄 효과적인 키워드로 관련 판례를 추가 검색합니다...")
 
-            # 각 키워드별로 개별 검색 수행
+            # API에서 잘 검색되는 조례 관련 키워드들
+            proven_keywords = ['조례 무효', '조례 취소', '위임범위초과', '포괄위임금지', '조례안', '지방자치법']
+
             additional_precedents = []
-            search_keywords = [k for k in query_keywords[:3] if k.strip()]  # 빈 문자열 제거
 
-            for keyword in search_keywords:
+            for proven_keyword in proven_keywords[:3]:  # 상위 3개만 사용
                 try:
-                    # '조례 + 키워드' 조합으로 검색
-                    combined_query = f"조례 {keyword}"
-                    st.info(f"🔍 키워드별 검색: '{combined_query}'")
+                    st.info(f"🔍 효과적 키워드 검색: '{proven_keyword}'")
 
                     keyword_params = params.copy()
-                    keyword_params['query'] = combined_query
+                    keyword_params['query'] = proven_keyword
                     keyword_params['display'] = 3  # 각 키워드당 3개씩
 
                     keyword_response = requests.get(precedent_search_url, params=keyword_params, timeout=15)
@@ -1207,7 +1231,7 @@ def search_precedents(query_keywords, max_results=10):
                         keyword_root = ET.fromstring(keyword_response.text)
                         keyword_precs = keyword_root.findall('prec')
 
-                        st.info(f"   → '{keyword}' 키워드로 {len(keyword_precs)}개 판례 발견")
+                        st.info(f"   → '{proven_keyword}' 키워드로 {len(keyword_precs)}개 판례 발견")
 
                         for prec_elem in keyword_precs:
                             try:
@@ -1237,7 +1261,7 @@ def search_precedents(query_keywords, max_results=10):
                                 continue
 
                 except Exception as e:
-                    st.warning(f"키워드 '{keyword}' 검색 중 오류: {str(e)}")
+                    st.warning(f"키워드 '{proven_keyword}' 검색 중 오류: {str(e)}")
                     continue
 
             if additional_precedents:
