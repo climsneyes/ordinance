@@ -16,10 +16,17 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import base64
 import numpy as np
-import pickle
 import hashlib
 from typing import Dict, List
 from sklearn.metrics.pairwise import cosine_similarity
+
+# Gemini File Search 통합
+from gemini_file_search import (
+    GeminiFileSearchManager,
+    search_relevant_guidelines_gemini,
+    search_violation_cases_gemini,
+    get_gemini_store_manager
+)
 
 # 페이지 설정
 st.set_page_config(
@@ -120,6 +127,12 @@ if 'selected_ordinances' not in st.session_state:
     st.session_state.selected_ordinances = []
 if 'vector_store' not in st.session_state:
     st.session_state.vector_store = None
+
+# Gemini File Search 관련 session state
+if 'use_gemini_search' not in st.session_state:
+    st.session_state.use_gemini_search = True  # 기본값: Gemini File Search 사용
+if 'gemini_store_manager' not in st.session_state:
+    st.session_state.gemini_store_manager = None
 
 def get_ordinance_detail(ordinance_id):
     """조례 상세 내용 가져오기"""
@@ -387,8 +400,6 @@ def get_superior_law_content_xml(law_name):
         import xml.etree.ElementTree as ET
         import re
 
-        st.write(f"[DEBUG] 상위법령 조회 시작: {law_name}")
-
         # 검색어 최적화: 띄어쓰기와 특수문자 정리
         search_query = law_name.strip()
 
@@ -403,7 +414,6 @@ def get_superior_law_content_xml(law_name):
         
         search_response = requests.get(search_url, params=search_params, timeout=30)
         if search_response.status_code != 200:
-            st.error(f"[DEBUG] 검색 실패: HTTP {search_response.status_code}")
             return get_superior_law_content_xml_fallback(law_name)
         
         search_root = ET.fromstring(search_response.text)
@@ -420,10 +430,8 @@ def get_superior_law_content_xml(law_name):
                         'id': law_id_elem.text,
                         'name': law_name_elem.text
                     })
-                    st.write(f"[DEBUG] 검색된 현행 법령: {law_name_elem.text}")
-        
+
         if not current_laws:
-            st.warning(f"[DEBUG] {law_name}의 현행 법령을 찾을 수 없음")
             return get_superior_law_content_xml_fallback(law_name)
         
         # 가장 관련성 높은 법령 선택 (개선된 매칭 알고리즘)
@@ -488,9 +496,7 @@ def get_superior_law_content_xml(law_name):
             # 5. 길이 페널티 완화 (너무 긴 법령명은 약간 감점)
             if len(found_name) > 30:
                 score -= 30
-                
-            st.write(f"[DEBUG] 법령 평가: {found_name} = {score}점")
-            
+
             if score > best_score:
                 best_score = score
                 best_law = law_info
@@ -498,15 +504,12 @@ def get_superior_law_content_xml(law_name):
         if best_law:
             law_id = best_law['id']
             exact_law_name = best_law['name']
-            st.write(f"[DEBUG] 최적 법령 선택: {exact_law_name} (ID: {law_id}, 점수: {best_score})")
         else:
             # 폴백: 첫 번째 법령
             law_id = current_laws[0]['id']
             exact_law_name = current_laws[0]['name']
-            st.write(f"[DEBUG] 기본 법령 선택: {exact_law_name} (ID: {law_id})")
-        
+
         if not law_id:
-            st.warning(f"[DEBUG] {law_name}의 현행 법령을 찾을 수 없음")
             return get_superior_law_content_xml_fallback(law_name)
         
         # 2단계: 상세 정보 가져오기
@@ -519,11 +522,9 @@ def get_superior_law_content_xml(law_name):
         
         detail_response = requests.get(detail_url, params=detail_params, timeout=30)
         if detail_response.status_code != 200:
-            st.error(f"[DEBUG] 상세 조회 실패: HTTP {detail_response.status_code}")
             return get_superior_law_content_xml_fallback(law_name)
-        
+
         detail_root = ET.fromstring(detail_response.text)
-        st.write(f"[DEBUG] 상세 정보 로드 완료 ({len(detail_response.text):,} 문자)")
         
         # 3단계: 성공적인 추출 로직 적용 - 연결된 본문으로 처리
         upper_law_text = ""
@@ -547,9 +548,7 @@ def get_superior_law_content_xml(law_name):
                 content = content.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').strip()
                 upper_law_text += '        ' + content + '\n'
                 ho_count += 1
-        
-        st.write(f"[DEBUG] 추출 통계: 조문내용 {jo_count}개, 항내용 {hang_count}개, 호내용 {ho_count}개")
-        
+
         if upper_law_text.strip():
             # 스마트 필터링: 조례 관련 키워드가 포함된 부분 우선 추출
             def smart_filter_content(content, max_length=50000):
@@ -617,7 +616,6 @@ def get_superior_law_content_xml(law_name):
             max_length = 80000
             if len(upper_law_text) > max_length:
                 truncated_text = smart_filter_content(upper_law_text, max_length)
-                st.warning(f"[DEBUG] 본문이 너무 길어 조례 관련 부분을 우선하여 {len(truncated_text):,}자로 축약했습니다 (원본: {len(upper_law_text):,}자)")
             else:
                 truncated_text = upper_law_text.strip()
             
@@ -627,52 +625,38 @@ def get_superior_law_content_xml(law_name):
                 'law_id': law_id,
                 'content': truncated_text
             }
-            
-            st.write(f"[DEBUG] 최종 결과: 연결된 본문 추출 완료, 총 {len(truncated_text):,}문자")
+
             return result
         else:
-            st.warning("[DEBUG] 조문 내용이 비어있음")
             return get_superior_law_content_xml_fallback(law_name)
-        
+
     except Exception as e:
-        st.error(f"[DEBUG] 예외 발생: {str(e)}")
         return get_superior_law_content_xml_fallback(law_name)
 
 def get_superior_law_content_xml_fallback(law_name):
     """XML 방식 폴백 (간소화 버전)"""
     try:
-        st.write(f"[DEBUG XML] XML 폴백 모드 시작: {law_name}")
-        
         search_params = {
-            'OC': OC, 
+            'OC': OC,
             'target': 'law',
             'type': 'XML',
             'query': law_name,
             'display': 5,
             'search': 1
         }
-        
-        st.write(f"[DEBUG XML] XML 검색 파라미터: {search_params}")
-        
+
         search_response = requests.get(search_url, params=search_params, timeout=30)
-        st.write(f"[DEBUG XML] XML 검색 응답 상태: {search_response.status_code}")
-        st.write(f"[DEBUG XML] 응답 내용 (처음 1000자): {search_response.text[:1000]}")
         
         if search_response.status_code != 200:
-            st.error(f"[DEBUG XML] XML API 호출 실패: HTTP {search_response.status_code}")
             return None
-            
+
         if not search_response.text.strip():
-            st.error("[DEBUG XML] XML 응답이 비어있습니다")
             return None
-            
+
         try:
             search_root = ET.fromstring(search_response.text)
         except ET.ParseError as xml_err:
-            st.error(f"[DEBUG XML] XML 파싱 실패: {xml_err}")
-            st.write(f"[DEBUG XML] 원본 응답: {search_response.text}")
             return None
-        st.write(f"[DEBUG XML] XML 파싱 완료")
         
         law_id = None
         exact_law_name = None
@@ -726,7 +710,6 @@ def get_superior_law_content_xml_fallback(law_name):
         }
         
     except Exception as e:
-        st.error(f"[DEBUG XML] XML 폴백 예외 발생: {str(e)}")
         return None
 
 # 기존 함수를 새 XML 방식으로 교체
@@ -799,8 +782,6 @@ def group_laws_by_hierarchy(superior_laws):
     # 정규화 과정 로깅
     for original in superior_laws:
         normalized = normalize_law_name(original)
-        if normalized != original:
-            print(f"[DEBUG] 정규화: '{original}' -> '{normalized}'")
 
     # 2단계: 정규화된 법령명으로 그룹화
     for law_name in normalized_laws:
@@ -836,11 +817,6 @@ def get_all_superior_laws_content(superior_laws):
     
     # 1단계: 법령을 계층별로 그룹화
     law_groups = group_laws_by_hierarchy(superior_laws)
-    
-    st.write(f"[DEBUG] 법령 그룹 분석:")
-    for base_name, laws in law_groups.items():
-        available = [k for k, v in laws.items() if v is not None]
-        st.write(f"  • {base_name}: {', '.join(available)}")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -908,15 +884,6 @@ def get_all_superior_laws_content(superior_laws):
         
         group['text_length'] = group_chars
         total_chars += group_chars
-        
-        st.write(f"[DEBUG] {group.get('base_name', '알수없음')} 그룹: {group_chars:,}자")
-    
-    # 8만자를 초과하는 경우 경고만 표시하고 모든 내용 유지 (필터링 비활성화)
-    if total_chars > max_chars:
-        st.warning(f"⚠️ 법령 내용이 {total_chars:,}자로 8만자를 초과합니다. 하지만 모든 내용을 유지합니다.")
-        st.info("💡 Gemini가 긴 텍스트를 처리할 수 있으므로 필터링하지 않고 전체 내용을 전달합니다.")
-    
-    st.success(f"✅ 총 {len(superior_laws_content)}개 법령 그룹, {total_chars:,}자를 Gemini에게 전달합니다.")
     
     return superior_laws_content
 
@@ -962,76 +929,6 @@ def get_gemini_embedding(text, api_key):
         return result['embedding']
     except Exception as e:
         st.error(f"임베딩 생성 오류: {str(e)}")
-        return None
-
-def create_vector_store(pdf_path, api_key):
-    """자치법규 가이드 PDF를 벡터스토어로 변환 (pickle 방식)"""
-    try:
-        vector_store_path = "jachi_guide_2022_vectorstore.pkl"
-        
-        # 기존 벡터스토어가 있으면 로드
-        if os.path.exists(vector_store_path):
-            with open(vector_store_path, 'rb') as f:
-                vector_store = pickle.load(f)
-            st.info("✅ 기존 벡터스토어를 로드했습니다.")
-            return vector_store
-        
-        # PDF 텍스트 추출
-        with open(pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            full_text = ''
-            for page in reader.pages:
-                full_text += page.extract_text() + '\n'
-        
-        # 텍스트 청킹
-        chunks = chunk_text(full_text)
-        st.info(f"📄 {len(chunks)}개의 텍스트 청크로 분할했습니다.")
-        
-        # 청크들을 임베딩하고 벡터스토어에 저장
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        documents = []
-        embeddings = []
-        metadatas = []
-        
-        for i, chunk in enumerate(chunks):
-            status_text.text(f"임베딩 생성 중... ({i+1}/{len(chunks)})")
-            progress_bar.progress((i + 1) / len(chunks))
-            
-            # Gemini로 임베딩 생성
-            embedding = get_gemini_embedding(chunk['text'], api_key)
-            if embedding:
-                documents.append(chunk['text'])
-                embeddings.append(embedding)
-                metadatas.append({
-                    'start': chunk['start'],
-                    'end': chunk['end'],
-                    'page': 'guide_2022',
-                    'chunk_id': i
-                })
-        
-        # 벡터스토어 생성
-        vector_store = {
-            'documents': documents,
-            'embeddings': np.array(embeddings),
-            'metadatas': metadatas,
-            'created_at': datetime.now().isoformat()
-        }
-        
-        # pickle로 저장
-        if documents:
-            with open(vector_store_path, 'wb') as f:
-                pickle.dump(vector_store, f)
-            st.success(f"✅ {len(documents)}개 청크를 벡터스토어에 저장했습니다.")
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        return vector_store
-        
-    except Exception as e:
-        st.error(f"벡터스토어 생성 오류: {str(e)}")
         return None
 
 def is_valid_text(text):
@@ -1141,191 +1038,8 @@ def extract_legal_reasoning_from_analysis(analysis_text):
         matches = re.findall(pattern, analysis_text, re.DOTALL)
         extracted_context['reasoning'].extend(matches)
 
-    # 5. 디버깅용 출력
-    print(f"[DEBUG] 추출된 법적 근거: {extracted_context['legal_basis']}")
-    print(f"[DEBUG] 추출된 핵심 개념: {len(extracted_context['key_concepts'])}개")
-    print(f"[DEBUG] 추출된 문제점: {len(extracted_context['problem_details'])}개")
-
     return extracted_context
 
-def search_relevant_guidelines(query, vector_store, api_key=None, top_k=3):
-    """쿼리와 관련된 가이드라인 검색 (Gemini 기반 또는 무료 버전)"""
-    try:
-        print(f"[DEBUG] 검색 쿼리: '{query}'")
-
-        if not vector_store or 'embeddings' not in vector_store:
-            print("[DEBUG] 벡터스토어가 없거나 embeddings 키가 없음")
-            return []
-
-        print(f"[DEBUG] 벡터스토어 키: {list(vector_store.keys())}")
-
-        # 벡터스토어 타입 확인 (Gemini 기반 vs 무료 버전)
-        is_free_version = 'model_name' in vector_store and isinstance(vector_store['model_name'], str)
-        print(f"[DEBUG] 무료 버전 여부: {is_free_version}")
-
-        if is_free_version:
-            # 무료 sentence-transformers 기반 검색
-            try:
-                from sentence_transformers import SentenceTransformer
-                print("[DEBUG] SentenceTransformer 모델 로딩...")
-                model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-                query_embedding = model.encode([query])[0]
-                print(f"[DEBUG] 쿼리 임베딩 생성 완료, 차원: {len(query_embedding)}")
-            except ImportError:
-                st.warning("sentence-transformers 라이브러리가 필요합니다.")
-                return []
-        else:
-            # Gemini 기반 검색
-            if not api_key:
-                print("[DEBUG] Gemini API 키가 없음")
-                return []
-            query_embedding = get_gemini_embedding(query, api_key)
-            if not query_embedding:
-                print("[DEBUG] Gemini 임베딩 생성 실패")
-                return []
-
-        # 코사인 유사도 계산
-        query_embedding = np.array(query_embedding).reshape(1, -1)
-        print(f"[DEBUG] 저장된 임베딩 수: {len(vector_store['embeddings'])}")
-        similarities = cosine_similarity(query_embedding, vector_store['embeddings'])[0]
-        print(f"[DEBUG] 유사도 계산 완료, 최고 유사도: {max(similarities):.4f}, 최저 유사도: {min(similarities):.4f}")
-
-        # 최소 유사도 필터링 (기준 상향)
-        min_similarity = 0.5 if is_free_version else 0.3  # 기준을 높여서 관련성 높은 결과만
-        valid_indices = np.where(similarities >= min_similarity)[0]
-        print(f"[DEBUG] 최소 유사도 {min_similarity} 이상인 결과: {len(valid_indices)}개")
-
-        # 추가적으로 키워드 기반 관련성 검사 (개선된 버전)
-        keyword_filtered_indices = []
-        law_keywords = ['조례', '법률', '규정', '위반', '위법', '허가', '승인', '사무', '권한', '기관위임', '재의', '제소', '의결', '대법원', '판례']
-
-        for idx in valid_indices:
-            try:
-                text = vector_store['documents'][idx]
-                # 한글이 포함되어 있고 의미 있는 내용인지 확인
-                korean_chars = sum(1 for char in text if '\uac00' <= char <= '\ud7af')
-
-                if korean_chars >= 10:  # 최소 10개 이상의 한글이 있어야 함
-                    text_lower = text.lower()
-                    keyword_count = sum(1 for keyword in law_keywords if keyword in text_lower)
-
-                    # 조건 완화: 1개 이상의 키워드만 있어도 포함
-                    if keyword_count >= 1:
-                        keyword_filtered_indices.append(idx)
-                        print(f"[DEBUG] 키워드 매칭: {keyword_count}개 키워드, 한글 {korean_chars}개 - 포함")
-                    else:
-                        print(f"[DEBUG] 키워드 부족: {keyword_count}개 키워드 - 제외")
-                else:
-                    print(f"[DEBUG] 한글 부족: {korean_chars}개 한글 - 제외")
-
-            except Exception as e:
-                print(f"[DEBUG] 키워드 필터링 오류: {str(e)}")
-                continue
-
-        if keyword_filtered_indices:
-            valid_indices = np.array(keyword_filtered_indices)
-            print(f"[DEBUG] 키워드 필터링 후 결과: {len(valid_indices)}개")
-        else:
-            print("[DEBUG] 키워드 필터링 결과가 없어 원래 결과 유지")
-
-        if len(valid_indices) == 0:
-            print("[DEBUG] 유효한 결과가 없음")
-            return []
-
-        # 상위 k개 결과 선택
-        valid_similarities = similarities[valid_indices]
-        top_indices = valid_indices[np.argsort(valid_similarities)[-top_k:][::-1]]
-        print(f"[DEBUG] 선택된 상위 {len(top_indices)}개 결과의 유사도: {[similarities[i] for i in top_indices]}")
-        
-        relevant_chunks = []
-        for idx in top_indices:
-            original_text = vector_store['documents'][idx]
-
-            # 텍스트 품질 검사 및 필터링
-            if not is_valid_text(original_text):
-                print(f"[DEBUG] 품질 불량으로 제외: {original_text[:50]}...")
-                continue
-
-            # 텍스트 정제
-            cleaned_text = clean_text_content(original_text)
-
-            if len(cleaned_text.strip()) < 50:  # 너무 짧은 텍스트 제외
-                print(f"[DEBUG] 텍스트 길이 부족으로 제외: {cleaned_text[:50]}...")
-                continue
-
-            relevant_chunks.append({
-                'text': cleaned_text,
-                'original_text': original_text,  # 디버깅용 원본 보관
-                'similarity': similarities[idx],
-                'distance': 1 - similarities[idx],
-                'metadata': vector_store['metadatas'][idx],
-                'source': vector_store.get('pdf_path', 'unknown')
-            })
-        
-        return relevant_chunks
-        
-    except Exception as e:
-        st.error(f"가이드라인 검색 오류: {str(e)}")
-        return []
-
-def search_multiple_vectorstores(query, api_key=None, top_k_per_store=2):
-    """여러 벡터스토어에서 복합 검색을 수행하는 함수"""
-    try:
-        # 사용 가능한 벡터스토어 경로들
-        vectorstore_paths = [
-            "enhanced_vectorstore_20250914_101739.pkl",  # 향상된 벡터스토어 (양쪽 PDF 포함, 리랭커 지원)
-        ]
-        
-        vectorstore_names = {
-            "enhanced_vectorstore_20250914_101739.pkl": "통합 법령 문서 (재의·제소 + 자치법규입안가이드)"
-        }
-        
-        all_results = []
-        loaded_stores = []
-        
-        for path in vectorstore_paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, 'rb') as f:
-                        vector_store = pickle.load(f)
-                    
-                    # 각 벡터스토어에서 검색 수행
-                    results = search_relevant_guidelines(query, vector_store, api_key, top_k_per_store)
-                    
-                    # 결과에 소스 정보 추가
-                    store_name = vectorstore_names.get(os.path.basename(path), path)
-                    for result in results:
-                        result['source_store'] = store_name
-                        result['source_file'] = path
-                    
-                    all_results.extend(results)
-                    loaded_stores.append(store_name)
-                    
-                except Exception as e:
-                    st.warning(f"{path} 로드 실패: {str(e)}")
-                    continue
-        
-        if not all_results:
-            return [], []
-        
-        # 유사도 기준으로 정렬하고 상위 결과 선택
-        all_results.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        # 최대 6개 결과 반환 (각 스토어당 최대 2개씩)
-        final_results = []
-        store_counts = {}
-        
-        for result in all_results:
-            store_name = result['source_store']
-            if store_counts.get(store_name, 0) < top_k_per_store and len(final_results) < 6:
-                final_results.append(result)
-                store_counts[store_name] = store_counts.get(store_name, 0) + 1
-        
-        return final_results, loaded_stores
-        
-    except Exception as e:
-        st.error(f"복합 벡터스토어 검색 오류: {str(e)}")
-        return [], []
 
 def detect_agency_delegation(superior_article: Dict, ordinance_article: Dict, source_type: str) -> Dict:
     """기관위임사무 특화 판별 함수"""
@@ -1415,9 +1129,7 @@ def analyze_ordinance_vs_superior_laws(pdf_text, superior_laws_content):
     
     if not superior_laws_content:
         return "상위법령 정보가 없어 직접 비교 분석을 수행할 수 없습니다."
-    
-    st.write(f"[DEBUG] 계층별 상위법령 분석 시작 - {len(superior_laws_content)}개 법령 그룹")
-    
+
     # 조례에서 사무 관련 조문 추출
     ordinance_provisions = []
     lines = pdf_text.split('\n')
@@ -1640,7 +1352,7 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
     if comprehensive_analysis_results and isinstance(comprehensive_analysis_results, list) and len(comprehensive_analysis_results) > 0:
         total_risks = sum(len(result['violation_risks']) for result in comprehensive_analysis_results)
         prompt += f"\n**🚨 중요: 종합 조례 위법성 판례 적용 결과 ({total_risks}개 위험)**\n"
-        prompt += "PKL 파일에서 검색된 실제 조례 위법 판례들(기관위임사무, 상위법령 위배, 법률유보 위배, 권한배분 위배 등)을\n"
+        prompt += "참고 자료에서 검색된 실제 조례 위법 판례들(기관위임사무, 상위법령 위배, 법률유보 위배, 권한배분 위배 등)을\n"
         prompt += "현재 조례에 직접 적용한 분석 결과이다. 이 결과를 바탕으로 각 유형별 위법성을 정확히 판단하고 구체적인 개선방안을 제시해줘.\n"
         prompt += "---\n"
         
@@ -1924,13 +1636,29 @@ def create_comparison_document(pdf_text, search_results, analysis_results, super
                 doc.add_paragraph(f"   • 내용 {i+1} (유사도: {similarity_score:.3f})")
         doc.add_paragraph("")
 
-    # 각 API 분석 결과 추가
-    for result in analysis_results:
-        if 'error' in result:
-            doc.add_paragraph(f"{result['model']} API 오류: {result['error']}")
-            continue
+    # 최종 분석 결과만 추가 (중복 방지)
+    # 우선순위: 자료 참고 보강분석 > OpenAI 추가 분석 > 1차 분석
+    final_report = None
+    for result in reversed(analysis_results):  # 역순으로 최신 결과 우선
+        if 'error' not in result:
+            if "자료 참고 보강분석" in result.get('model', ''):
+                final_report = result
+                break
+            elif "자료 참고" in result.get('model', '') or "OpenAI" in result.get('model', ''):
+                final_report = result
+                break
 
-        content = result['content']
+    # 자료 참고나 OpenAI가 없으면 1차 분석 사용
+    if not final_report:
+        for result in analysis_results:
+            if 'error' not in result and "1차 분석" in result.get('model', ''):
+                final_report = result
+                break
+
+    # 최종 보고서가 있으면 추가
+    if final_report:
+        doc.add_heading(f'📋 {final_report["model"]}', level=2)
+        content = final_report['content']
 
         # 🆕 표 파싱 및 처리
         tables_data = parse_table_from_text(content)
@@ -1956,10 +1684,21 @@ def create_comparison_document(pdf_text, search_results, analysis_results, super
                                 title_text = re.sub(r'[#*`>\-\[\]]+', '', text_line_clean)
                                 doc.add_heading(title_text, level=3)
                             else:
-                                # 일반 텍스트
-                                clean_text = re.sub(r'[#*`>]+', '', text_line_clean)
-                                if clean_text:
-                                    doc.add_paragraph(clean_text)
+                                # 일반 텍스트 - 마크다운 볼드(**text**) 처리
+                                if clean_text := text_line_clean.strip():
+                                    p = doc.add_paragraph()
+                                    # **텍스트** 형식의 볼드 처리
+                                    parts = re.split(r'(\*\*[^*]+\*\*)', clean_text)
+                                    for part in parts:
+                                        if part.startswith('**') and part.endswith('**'):
+                                            # 볼드 텍스트
+                                            run = p.add_run(part[2:-2])
+                                            run.bold = True
+                                        elif part:
+                                            # 일반 텍스트 (남은 마크다운 기호 제거)
+                                            clean_part = re.sub(r'[#`>]+', '', part)
+                                            if clean_part:
+                                                p.add_run(clean_part)
                     current_section = []
 
                 # 표 처리는 skip (이미 tables_data에서 처리됨)
@@ -1979,14 +1718,35 @@ def create_comparison_document(pdf_text, search_results, analysis_results, super
                         title_text = re.sub(r'[#*`>\-\[\]]+', '', text_line_clean)
                         doc.add_heading(title_text, level=3)
                     else:
-                        clean_text = re.sub(r'[#*`>]+', '', text_line_clean)
-                        if clean_text:
-                            doc.add_paragraph(clean_text)
+                        # 일반 텍스트 - 마크다운 볼드(**text**) 처리
+                        if clean_text := text_line_clean.strip():
+                            p = doc.add_paragraph()
+                            # **텍스트** 형식의 볼드 처리
+                            parts = re.split(r'(\*\*[^*]+\*\*)', clean_text)
+                            for part in parts:
+                                if part.startswith('**') and part.endswith('**'):
+                                    # 볼드 텍스트
+                                    run = p.add_run(part[2:-2])
+                                    run.bold = True
+                                elif part:
+                                    # 일반 텍스트 (남은 마크다운 기호 제거)
+                                    clean_part = re.sub(r'[#`>]+', '', part)
+                                    if clean_part:
+                                        p.add_run(clean_part)
 
         # 🆕 파싱된 표들을 Word 문서에 추가
         for table_data in tables_data:
             add_table_to_doc(doc, table_data)
             doc.add_paragraph("")  # 표 간격
+    else:
+        # 최종 보고서가 없으면 오류 표시
+        doc.add_heading('⚠️ 분석 결과 없음', level=2)
+        doc.add_paragraph('분석 결과를 생성할 수 없습니다.')
+
+        # 오류 메시지 추가
+        for result in analysis_results:
+            if 'error' in result:
+                doc.add_paragraph(f"❌ {result['model']} 오류: {result['error']}")
 
     return doc
 
@@ -2020,7 +1780,31 @@ def main():
         st.header("🔑 API 설정")
         gemini_api_key = st.text_input("Gemini API 키", type="password", help="Google AI Studio에서 발급받은 API 키를 입력하세요")
         openai_api_key = st.text_input("OpenAI API 키", type="password", help="OpenAI 플랫폼에서 발급받은 API 키를 입력하세요")
-        
+
+        # Gemini File Search Store Manager 초기화
+        if gemini_api_key and st.session_state.gemini_store_manager is None:
+            try:
+                st.session_state.gemini_store_manager = get_gemini_store_manager(gemini_api_key)
+                st.success("✅ Gemini File Search 초기화 완료")
+            except Exception as e:
+                st.warning(f"⚠️ Gemini File Search 초기화 실패: {e}")
+
+        st.markdown("---")
+        st.subheader("🔍 검색 엔진 설정")
+
+        use_gemini = st.checkbox(
+            "Gemini File Search 사용 (권장)",
+            value=st.session_state.use_gemini_search,
+            help="기존 방식 대신 Gemini File Search API를 사용합니다. 더 정확한 검색 결과를 제공합니다."
+        )
+        st.session_state.use_gemini_search = use_gemini
+
+        if use_gemini:
+            if st.session_state.gemini_store_manager:
+                st.success("✅ Gemini File Search 활성화됨")
+            else:
+                st.warning("⚠️ Gemini API 키를 먼저 입력해주세요")
+
         st.header("🔑 API 키 설정 가이드")
         st.markdown("""
         <div class="step-card">
@@ -2080,14 +1864,6 @@ def main():
                 💡 **팁**: 처음에는 낮은 한도로 시작하여 사용량을 확인해보세요.
                 """)
 
-        # 벡터스토어 자동 로드 (백그라운드에서 조용히 처리)
-        vector_store_path = "enhanced_vectorstore_20250914_101739.pkl"
-        if st.session_state.vector_store is None and os.path.exists(vector_store_path):
-            try:
-                with open(vector_store_path, 'rb') as f:
-                    st.session_state.vector_store = pickle.load(f)
-            except Exception:
-                pass  # 조용히 실패
 
     # 메인 컨텐츠
     tab1, tab2, tab3 = st.tabs(["1️⃣ 조례 검색", "2️⃣ PDF 업로드", "3️⃣ AI 분석"])
@@ -2267,8 +2043,8 @@ def main():
             st.session_state.uploaded_pdf = uploaded_file
             st.success(f"파일이 업로드되었습니다: {uploaded_file.name}")
             
-            # PDF 내용 미리보기
-            if st.checkbox("PDF 내용 미리보기"):
+            # PDF 내용 미리보기 - expander로 변경하여 재실행 방지
+            with st.expander("PDF 내용 미리보기", expanded=False):
                 with st.spinner("PDF 내용을 읽는 중..."):
                     pdf_text = extract_pdf_text(uploaded_file)
                     if pdf_text:
@@ -2322,11 +2098,11 @@ def main():
                 analysis_type = f"전체 {len(st.session_state.search_results)}개 타 시도 조례와 비교 분석"
             st.markdown(f"**분석 유형**: {analysis_type}")
             
-            # PKL 파일 참고 옵션 (문제 발견 시 자동 활용)
-            use_pkl_auto = st.checkbox(
-                "🔍 문제 발견 시 PKL 파일 자동 참고", 
-                value=True, 
-                help="Gemini가 법적 문제점을 발견한 경우 자동으로 무료 벡터스토어를 참고하여 근거를 보강합니다."
+            # 자동 참고 자료 검색 옵션 (문제 발견 시 자동 활용)
+            use_auto_search = st.checkbox(
+                "🔍 문제 발견 시 자동 참고 자료 검색",
+                value=True,
+                help="법적 문제점을 발견한 경우 Gemini File Search를 통해 자동으로 관련 판례 및 법령 자료를 검색하여 근거를 보강합니다."
             )
             
             # 🆕 저장된 분석 결과가 있으면 먼저 표시
@@ -2371,9 +2147,9 @@ def main():
                 if has_problems and relevant_guidelines and loaded_stores:
                     st.success(f"🎯 **복합 자료 보강 분석 완료**: 문제점 탐지 → {len(loaded_stores)}개 자료 참고 → 보강 분석")
                 elif has_problems and relevant_guidelines:
-                    st.success("🎯 **지능형 분석 완료**: 문제점 탐지 → PKL 참고 → 보강 분석")
+                    st.success("🎯 **지능형 분석 완료**: 문제점 탐지 → 자료 검색 → 보강 분석")
                 elif has_problems:
-                    st.info("⚠️ **문제점 탐지 분석 완료**: PKL 참고 없이 기본 분석만 수행")
+                    st.info("⚠️ **문제점 탐지 분석 완료**: 자료 검색 없이 기본 분석만 수행")
                 else:
                     st.success("✅ **기본 분석 완료**: 특별한 문제점이 발견되지 않음")
 
@@ -2401,8 +2177,8 @@ def main():
                         if "보강" in final_report['model']:
                             st.success("🎯 **복합 자료 참고 보강 분석 결과**")
                             st.caption(f"📚 **활용 모델**: {final_report['model']}")
-                        elif "PKL 보강" in final_report['model']:
-                            st.success("🎯 **PKL 가이드라인 참고 보강 분석 결과**")
+                        elif "자료 참고" in final_report['model']:
+                            st.success("🎯 **참고 자료 기반 보강 분석 결과**")
                         elif "OpenAI" in final_report['model']:
                             st.info("📊 **OpenAI 추가 분석 결과**")
                         else:
@@ -2429,7 +2205,7 @@ def main():
                         stores_count = len(loaded_stores)
                         filename_prefix = f"복합자료보강분석({stores_count}개자료)" if is_first_ordinance else f"조례비교_복합자료분석({stores_count}개자료)"
                     elif has_problems and relevant_guidelines:
-                        filename_prefix = "지능형PKL보강분석" if is_first_ordinance else "조례비교_PKL보강분석"
+                        filename_prefix = "자료참고보강분석" if is_first_ordinance else "조례비교_자료분석"
                     elif has_problems:
                         filename_prefix = "문제점탐지분석" if is_first_ordinance else "조례비교_문제점분석"
                     else:
@@ -2460,82 +2236,52 @@ def main():
                         st.error("PDF 텍스트를 읽을 수 없습니다.")
                     else:
                         # 1단계: 상위법령 추출
-                        st.info("📋 1단계: 조례안에서 상위법령을 추출하고 있습니다...")
-                        superior_laws = extract_superior_laws(pdf_text)
+                        with st.spinner("조례안에서 상위법령을 추출하고 있습니다..."):
+                            superior_laws = extract_superior_laws(pdf_text)
                         
                         if superior_laws:
-                            st.success(f"✅ {len(superior_laws)}개의 상위법령을 발견했습니다:")
-                            for law in superior_laws:
-                                st.markdown(f"   • {law}")
-                            
                             # 2단계: 상위법령 내용 조회
-                            st.info("📚 2단계: 국가법령정보센터에서 상위법령 내용을 조회하고 있습니다...")
-                            superior_laws_content = get_all_superior_laws_content(superior_laws)
+                            with st.spinner("국가법령정보센터에서 상위법령 내용을 조회하고 있습니다..."):
+                                superior_laws_content = get_all_superior_laws_content(superior_laws)
                             
                             if superior_laws_content:
-                                st.success(f"✅ {len(superior_laws_content)}개의 상위법령 그룹을 성공적으로 조회했습니다:")
-                                total_articles = 0
-                                for law_group in superior_laws_content:
-                                    base_name = law_group['base_name']
-                                    
-                                    # 연결된 본문이 있는 경우
-                                    if 'combined_content' in law_group:
-                                        content_length = len(law_group['combined_content'])
-                                        st.markdown(f"   • **{base_name}**: 본문 {content_length:,}자")
-                                        total_articles += 1  # 하나의 연결된 법령으로 카운트
-                                    else:
-                                        # 기존 방식
-                                        available_laws = []
-                                        group_articles = 0
-                                        
-                                        for law_type, law_info in law_group['laws'].items():
-                                            if law_info:
-                                                type_name = {"law": "법률", "decree": "시행령", "rule": "시행규칙"}[law_type]
-                                                article_count = len(law_info.get('articles', []))
-                                                available_laws.append(f"{type_name}({article_count})")
-                                                group_articles += article_count
-                                        
-                                        st.markdown(f"   • **{base_name}**: {', '.join(available_laws)} = 총 {group_articles}개 조문")
-                                        total_articles += group_articles
-                                
-                                st.markdown(f"   **전체 조문 수**: {total_articles}개")
-                                
-                                # 🆕 상위법령 본문 내용 디버깅 표시
-                                if st.checkbox("🔍 Gemini가 참조할 상위법령 본문 내용 미리보기", key="debug_superior_content"):
-                                    with st.expander("📖 상위법령 전체 본문 내용", expanded=False):
-                                        for i, law_group in enumerate(superior_laws_content):
-                                            st.markdown(f"### [{i+1}] {law_group['base_name']}")
-                                            
-                                            # 연결된 본문이 있는 경우
-                                            if 'combined_content' in law_group and law_group['combined_content']:
-                                                content = law_group['combined_content']
-                                                st.markdown(f"**본문 길이**: {len(content):,}자")
-                                                st.text_area(
-                                                    f"{law_group['base_name']} 본문",
-                                                    content,
-                                                    height=200,
-                                                    key=f"content_{i}"
-                                                )
-                                            else:
-                                                # 개별 법령별 표시
-                                                for law_type, law_info in law_group['laws'].items():
-                                                    if law_info and 'articles' in law_info:
-                                                        type_name = {"law": "법률", "decree": "시행령", "rule": "시행규칙"}[law_type]
-                                                        st.markdown(f"#### {type_name}")
-                                                        
-                                                        # 조문별 내용 표시 (처음 5개만)
-                                                        for j, article in enumerate(law_info['articles'][:5]):
-                                                            st.markdown(f"**제{article.get('number', '?')}조** {article.get('title', '')}")
-                                                            content = article.get('content', '')[:500]
-                                                            st.markdown(f"```\n{content}{'...' if len(article.get('content', '')) > 500 else ''}\n```")
-                                                        
-                                                        if len(law_info['articles']) > 5:
-                                                            st.markdown(f"... (총 {len(law_info['articles'])}개 조문 중 5개만 표시)")
-                                            
-                                            st.markdown("---")
+                                # 상위법령 조회 성공 (디버그 메시지 제거)
+                                pass
+
+                                # 🆕 상위법령 본문 내용 디버깅 표시 (expander로 변경하여 재실행 방지)
+                                with st.expander("🔍 Gemini가 참조할 상위법령 본문 내용 미리보기", expanded=False):
+                                    for i, law_group in enumerate(superior_laws_content):
+                                        st.markdown(f"### [{i+1}] {law_group['base_name']}")
+
+                                        # 연결된 본문이 있는 경우
+                                        if 'combined_content' in law_group and law_group['combined_content']:
+                                            content = law_group['combined_content']
+                                            st.markdown(f"**본문 길이**: {len(content):,}자")
+                                            st.text_area(
+                                                f"{law_group['base_name']} 본문",
+                                                content,
+                                                height=200,
+                                                key=f"content_{i}"
+                                            )
+                                        else:
+                                            # 개별 법령별 표시
+                                            for law_type, law_info in law_group['laws'].items():
+                                                if law_info and 'articles' in law_info:
+                                                    type_name = {"law": "법률", "decree": "시행령", "rule": "시행규칙"}[law_type]
+                                                    st.markdown(f"#### {type_name}")
+
+                                                    # 조문별 내용 표시 (처음 5개만)
+                                                    for j, article in enumerate(law_info['articles'][:5]):
+                                                        st.markdown(f"**제{article.get('number', '?')}조** {article.get('title', '')}")
+                                                        content = article.get('content', '')[:500]
+                                                        st.markdown(f"```\n{content}{'...' if len(article.get('content', '')) > 500 else ''}\n```")
+
+                                                    if len(law_info['articles']) > 5:
+                                                        st.markdown(f"... (총 {len(law_info['articles'])}개 조문 중 5개만 표시)")
+
+                                        st.markdown("---")
                                 
                                 # 2-1단계: 상위법령 직접 비교 분석
-                                st.info("⚖️ 2-1단계: 조례와 상위법령 직접 비교 분석을 수행합니다...")
                                 try:
                                     comparison_results = analyze_ordinance_vs_superior_laws(pdf_text, superior_laws_content)
                                     
@@ -2568,11 +2314,11 @@ def main():
                                 except Exception as e:
                                     st.error(f"상위법령 직접 비교 분석 중 오류: {str(e)}")
                                 
-                                # 상위법령 내용 미리보기 (계층별 그룹화)
-                                if st.checkbox("🔍 조회된 상위법령 내용 미리보기 (계층별)"):
+                                # 상위법령 내용 미리보기 (계층별 그룹화) - expander로 변경하여 재실행 방지
+                                with st.expander("🔍 조회된 상위법령 내용 미리보기 (계층별)", expanded=False):
                                     for law_group in superior_laws_content:
                                         base_name = law_group['base_name']
-                                        
+
                                         # 연결된 본문이 있는 경우
                                         if 'combined_content' in law_group:
                                             content_preview = law_group['combined_content'][:500] + "..." if len(law_group['combined_content']) > 500 else law_group['combined_content']
@@ -2581,17 +2327,17 @@ def main():
                                         else:
                                             # 기존 방식
                                             with st.expander(f"📋 {base_name} 계층 ({len(law_group.get('combined_articles', []))}개 조문)", expanded=False):
-                                                
+
                                                 # 계층별 법령 정보 표시
                                                 st.markdown("**📚 포함된 법령:**")
                                                 for law_type, law_info in law_group['laws'].items():
                                                     if law_info and 'articles' in law_info:
                                                         type_name = "법률" if law_type == 'law' else ("시행령" if law_type == 'decree' else "시행규칙")
                                                         st.markdown(f"- [{type_name}] {law_info['law_name']} ({len(law_info['articles'])}개 조문)")
-                                                
+
                                                 st.markdown("\n**📖 통합 조문 (처음 5개):**")
                                                 combined_articles = law_group.get('combined_articles', [])
-                                                for article in combined_articles[:5]:  
+                                                for article in combined_articles[:5]:
                                                     st.markdown(f"**{article['number']} {article['title']}**")
                                                     st.markdown(article['content'][:200] + "..." if len(article['content']) > 200 else article['content'])
                                                     st.markdown("---")
@@ -2604,7 +2350,6 @@ def main():
                             superior_laws_content = None
                         
                         # 3단계: Gemini 1차 분석 (문제점 탐지)
-                        st.info("🤖 3단계: Gemini 1차 분석을 수행합니다...")
                         analysis_results = []
                         is_first_ordinance = not has_search_results
 
@@ -2615,7 +2360,78 @@ def main():
                             st.info(f"📋 선택된 {len(search_results_for_analysis)}개 조례로 분석을 진행합니다.")
                         else:
                             search_results_for_analysis = st.session_state.search_results if has_search_results else []
-                        
+
+                        # 🆕 3-1단계: 위법 판례 선제 검색 (모든 조문에 대해)
+                        theoretical_results = []
+                        if st.session_state.gemini_store_manager and gemini_api_key:
+                            with st.spinner("📚 업로드된 조례의 모든 조문에 대한 위법 판례를 검색하고 있습니다..."):
+                                try:
+                                    # PDF에서 조례명 추출 (처음 10줄에서)
+                                    ordinance_name = ""
+                                    import re
+                                    lines = pdf_text.split('\n')
+                                    for line in lines[:10]:
+                                        line = line.strip()
+                                        # 조례명 패턴: "○○시 ○○ 조례" 또는 "○○에 관한 조례"
+                                        name_match = re.search(r'([\w가-힣]+(?:시|도|군|구)\s+[\w가-힣\s]+(?:조례|조례안))', line)
+                                        if not name_match:
+                                            name_match = re.search(r'([\w가-힣\s]+에\s+관한\s+조례(?:안)?)', line)
+                                        if name_match:
+                                            ordinance_name = name_match.group(1).strip()
+                                            st.info(f"📋 조례명: {ordinance_name}")
+                                            break
+
+                                    # 조례에서 모든 조문 추출
+                                    ordinance_articles = []
+                                    current_article = ""
+                                    current_content = ""
+
+                                    # 조례명을 첫 번째 항목으로 추가 (검색에 활용)
+                                    if ordinance_name:
+                                        ordinance_articles.append(f"조례명: {ordinance_name}")
+
+                                    for line in lines:
+                                        line = line.strip()
+                                        if line.startswith('제') and '조' in line:
+                                            if current_article and current_content:
+                                                ordinance_articles.append(f"{current_article} {current_content.strip()}")
+                                            current_article = line
+                                            current_content = ""
+                                        else:
+                                            current_content += line + " "
+
+                                    # 마지막 조문 추가
+                                    if current_article and current_content:
+                                        ordinance_articles.append(f"{current_article} {current_content.strip()}")
+
+                                    # ❌ 조기 검색 제거: 조문만으로는 맥락이 부족하여 RAG 효과가 낮음
+                                    # 대신 1차 분석 후 분석 결과를 바탕으로 정밀 검색 수행 (2480행 참조)
+                                    # if ordinance_articles:
+                                    #     theoretical_results_raw = search_violation_cases_gemini(
+                                    #         ordinance_articles=ordinance_articles,
+                                    #         api_key=gemini_api_key,
+                                    #         store_manager=st.session_state.gemini_store_manager,
+                                    #         max_results=12
+                                    #     )
+                                    #     theoretical_results = theoretical_results_raw
+                                    #
+                                    #     if theoretical_results:
+                                    #         st.success(f"✅ {len(theoretical_results)}개의 관련 위법 판례/재의제소 사례를 찾았습니다!")
+
+                                    # 초기화: 1차 분석 후 재검색으로 채워질 예정
+                                    theoretical_results = []
+
+                                    # 세션에 저장하여 프롬프트에서 사용 (나중에 재검색으로 업데이트됨)
+                                    st.session_state.theoretical_results = theoretical_results
+
+                                    # 미리보기 제거: 조기 검색을 제거했으므로 이 시점에는 비어있음
+                                    # 1차 분석 후 정밀 검색 결과는 2580행의 "정밀 검색 결과 미리보기"에서 표시됨
+
+                                except Exception as e:
+                                    st.warning(f"⚠️ 조문 추출 중 오류 (계속 진행): {str(e)}")
+                                    theoretical_results = []
+                                    st.session_state.theoretical_results = theoretical_results
+
                         # Gemini 1차 분석 (문제점 탐지용)
                         first_analysis = None
                         has_problems = False
@@ -2633,100 +2449,207 @@ def main():
                                 theoretical_results = st.session_state.get('theoretical_results', None)
                                 first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results)
                                 
-                                # 🆕 Gemini 전송 프롬프트 디버깅 표시
-                                if st.checkbox("🔍 Gemini에게 전송되는 프롬프트 내용 확인", key="debug_gemini_prompt"):
-                                    with st.expander("📤 Gemini 전송 프롬프트", expanded=False):
-                                        st.markdown("### 프롬프트 구조 분석")
-                                        st.markdown(f"**전체 길이**: {len(first_prompt):,}자")
-                                        
-                                        # 상위법령 내용 부분만 추출
-                                        if "상위법령들의 실제 조문 내용" in first_prompt:
-                                            law_start = first_prompt.find("상위법령들의 실제 조문 내용")
-                                            law_end = first_prompt.find("3. [검토 시 유의사항]")
-                                            if law_end == -1:
-                                                law_end = law_start + 5000  # 기본값
-                                            
-                                            law_content = first_prompt[law_start:law_end]
-                                            st.markdown(f"**상위법령 내용 길이**: {len(law_content):,}자")
-                                            
-                                            st.text_area(
-                                                "상위법령 관련 프롬프트 내용",
-                                                law_content[:3000] + "..." if len(law_content) > 3000 else law_content,
-                                                height=300,
-                                                key="prompt_law_content"
-                                            )
-                                        
-                                        # 전체 프롬프트 표시 (처음 2000자만)
+                                # 🆕 Gemini 전송 프롬프트 디버깅 표시 - expander로 변경하여 재실행 방지
+                                with st.expander("🔍 Gemini에게 전송되는 프롬프트 내용 확인", expanded=False):
+                                    st.markdown("### 프롬프트 구조 분석")
+                                    st.markdown(f"**전체 길이**: {len(first_prompt):,}자")
+
+                                    # 상위법령 내용 부분만 추출
+                                    if "상위법령들의 실제 조문 내용" in first_prompt:
+                                        law_start = first_prompt.find("상위법령들의 실제 조문 내용")
+                                        law_end = first_prompt.find("3. [검토 시 유의사항]")
+                                        if law_end == -1:
+                                            law_end = law_start + 5000  # 기본값
+
+                                        law_content = first_prompt[law_start:law_end]
+                                        st.markdown(f"**상위법령 내용 길이**: {len(law_content):,}자")
+
                                         st.text_area(
-                                            "전체 프롬프트 (처음 2000자)",
-                                            first_prompt[:2000] + "..." if len(first_prompt) > 2000 else first_prompt,
-                                            height=400,
-                                            key="full_prompt"
+                                            "상위법령 관련 프롬프트 내용",
+                                            law_content[:3000] + "..." if len(law_content) > 3000 else law_content,
+                                            height=300,
+                                            key="prompt_law_content"
                                         )
+
+                                    # 전체 프롬프트 표시 (처음 2000자만)
+                                    st.text_area(
+                                        "전체 프롬프트 (처음 2000자)",
+                                        first_prompt[:2000] + "..." if len(first_prompt) > 2000 else first_prompt,
+                                        height=400,
+                                        key="full_prompt"
+                                    )
                                 
                                 response = model.generate_content(first_prompt)
                                 
                                 if response and hasattr(response, 'text') and response.text:
                                     first_analysis = response.text
-                                    
+
                                     # 문제점 키워드 탐지
                                     problem_keywords = [
                                         "위반", "문제", "충돌", "부적절", "개선", "수정", "보완",
                                         "법령 위반", "상위법령", "위법", "불일치", "모순", "우려"
                                     ]
-                                    
+
                                     has_problems = any(keyword in first_analysis for keyword in problem_keywords)
-                                    
+
                                     if has_problems:
                                         st.warning(f"⚠️ Gemini가 잠재적 문제점을 발견했습니다!")
-                                        
-                                        # 🆕 2차 분석: 발견된 문제점에 대한 관련 위법 판례 검색
-                                        st.info("🔍 2-0단계: 발견된 문제점에 대한 관련 위법 판례를 PKL에서 검색합니다...")
-                                        
-                                        try:
-                                            from comprehensive_violation_analysis import search_theoretical_background
 
-                                            # 🔍 Gemini 분석 결과에서 구체적인 근거 추출
-                                            extracted_context = extract_legal_reasoning_from_analysis(first_analysis)
+                                    # 🆕 3-2단계: Gemini 분석 결과 기반 정밀 재검색
+                                    # ✅ 위법성 유무와 관계없이 항상 검색 (유사 사례도 참고 가치 있음)
+                                    if st.session_state.gemini_store_manager:
+                                        with st.spinner("🔍 1차 분석 결과를 기반으로 관련 판례를 정밀 검색하고 있습니다..."):
+                                            try:
+                                                # 핵심 키워드 추출 (조례명 + 구체적인 조항 제목)
+                                                import re
 
-                                            # 문제점별 이론 검색 (추출된 문맥 활용)
-                                            detected_problems = [kw for kw in problem_keywords if kw in first_analysis]
-                                            theoretical_results = search_theoretical_background(
-                                                detected_problems,
-                                                ['3. 지방자치단체의 재의·제소 조례 모음집(Ⅸ) (1)_new_vectorstore.pkl'],
-                                                max_results=8,
-                                                context_analysis=extracted_context  # 추출된 문맥 전달
-                                            )
-                                            
-                                            if theoretical_results:
-                                                st.success(f"✅ {len(theoretical_results)}개의 관련 이론/판례를 찾았습니다!")
-                                                
-                                                with st.expander("📚 문제점 관련 위법 판례", expanded=False):
-                                                    for i, theory in enumerate(theoretical_results[:5]):  # 상위 5개만 표시
-                                                        context_rel = theory.get('context_relevance', 0)
-                                                        matched_concepts = theory.get('matched_concepts', [])
+                                                # 1. 조례명이 있으면 사용
+                                                search_keywords = []
+                                                if ordinance_name:
+                                                    search_keywords.append(ordinance_name)
 
-                                                        st.markdown(f"**[{i+1}] {theory['topic']}**")
-                                                        st.markdown(f"📊 **관련도**: {theory['relevance_score']:.3f} | **문맥관련성**: {context_rel}")
+                                                # 2. 분석 결과에서 제○조 패턴 추출
+                                                article_mentions = re.findall(r'제\s*\d+\s*조[^,\n]{0,30}', first_analysis)
+                                                search_keywords.extend(article_mentions[:5])
 
-                                                        if matched_concepts:
-                                                            st.markdown(f"🔍 **매칭된 개념**: {', '.join(matched_concepts[:3])}")
+                                                # 3. 핵심 법적 쟁점 키워드 추출
+                                                key_issues = []
+                                                issue_patterns = [
+                                                    r'(기관위임사무)',
+                                                    r'(직업선택의\s*자유)',
+                                                    r'(계약[의]?\s*자유)',
+                                                    r'(법률유보[원칙]?)',
+                                                    r'(평등권)',
+                                                    r'(재산권)',
+                                                    r'(영업의\s*자유)',
+                                                    r'(과잉금지[원칙]?)',
+                                                ]
+                                                for pattern in issue_patterns:
+                                                    matches = re.findall(pattern, first_analysis)
+                                                    key_issues.extend(matches)
 
-                                                        content_preview = theory['content'][:300] + "..." if len(theory['content']) > 300 else theory['content']
-                                                        st.markdown(f"📄 **내용**: {content_preview}")
-                                                        st.markdown("---")
-                                                
-                                                # 위법 판례를 포함한 재분석 프롬프트에 추가할 수 있도록 저장
-                                                st.session_state['theoretical_results'] = theoretical_results
-                                            else:
-                                                st.warning("관련 위법 판례를 찾지 못했습니다.")
+                                                # 중복 제거
+                                                key_issues = list(set(key_issues))[:5]
 
-                                        except Exception as e:
-                                            st.error(f"위법 판례 검색 중 오류: {str(e)}")
-                                            st.session_state['theoretical_results'] = None
+                                                # 1️⃣ 판례 및 사례 검색 쿼리 생성 (간결하게)
+                                                if ordinance_name and key_issues:
+                                                    # 조례명 + 법적 쟁점
+                                                    case_query = f"'{ordinance_name}'과 관련된 {', '.join(key_issues)} 위반 판례와 재의·제소 사례를 찾아주세요."
+                                                elif ordinance_name:
+                                                    # 조례명만
+                                                    case_query = f"'{ordinance_name}'의 위법 판례, 재의 요구, 제소 사례를 찾아주세요."
+                                                elif key_issues:
+                                                    # 법적 쟁점만
+                                                    case_query = f"{', '.join(key_issues)} 위반 조례 판례와 재의·제소 사례를 찾아주세요."
+                                                else:
+                                                    # 일반 검색
+                                                    case_query = "조례 위법 판례와 재의·제소 사례를 찾아주세요."
+
+                                                # 2️⃣ 이론적 설명 및 가이드라인 검색 쿼리 생성
+                                                if key_issues:
+                                                    # 구체적인 법적 쟁점이 있는 경우
+                                                    theory_query = f"{', '.join(key_issues)}에 대한 법리, 이론적 설명, 판단 기준을 설명해주세요."
+                                                else:
+                                                    # 일반적인 조례 제정 이론 검색
+                                                    theory_query = "조례 제정의 법리와 원칙, 상위법령 위배 판단 기준을 설명해주세요."
+
+                                                # 판례/사례 검색 수행
+                                                case_result = st.session_state.gemini_store_manager.search(
+                                                    case_query,
+                                                    top_k=5
+                                                )
+
+                                                # 이론/가이드라인 검색 수행
+                                                theory_result = st.session_state.gemini_store_manager.search(
+                                                    theory_query,
+                                                    top_k=5
+                                                )
+
+                                                # 검색 결과 통합
+                                                case_answer = case_result.get('answer', '')
+                                                case_sources = case_result.get('sources', [])
+
+                                                theory_answer = theory_result.get('answer', '')
+                                                theory_sources = theory_result.get('sources', [])
+
+                                                # 두 검색 결과를 결합
+                                                combined_answer = ""
+                                                combined_sources = []
+
+                                                if case_answer and len(case_answer) > 200:
+                                                    combined_answer += "## 📚 관련 판례 및 재의·제소 사례\n\n"
+                                                    combined_answer += case_answer
+                                                    combined_sources.extend(case_sources)
+
+                                                if theory_answer and len(theory_answer) > 200:
+                                                    if combined_answer:
+                                                        combined_answer += "\n\n---\n\n"
+                                                    combined_answer += "## 📖 이론적 근거 및 법리 해설\n\n"
+                                                    combined_answer += theory_answer
+                                                    combined_sources.extend(theory_sources)
+
+                                                # 최종 답변 설정
+                                                refined_answer = combined_answer if combined_answer else ""
+                                                refined_sources = combined_sources
+
+                                                if refined_answer and len(refined_answer) > 500:
+                                                    # 기존 판례 결과에 추가
+                                                    search_summary = []
+                                                    if case_answer and len(case_answer) > 200:
+                                                        search_summary.append(f"판례/사례 {len(case_answer)}자")
+                                                    if theory_answer and len(theory_answer) > 200:
+                                                        search_summary.append(f"이론/법리 {len(theory_answer)}자")
+
+                                                    refined_case = {
+                                                        'violation_type': '정밀 검색 결과 (판례 + 이론)',
+                                                        'content': refined_answer,
+                                                        'similarity': 0.98,
+                                                        'topic': f'정밀 검색: 판례·사례 및 이론적 근거 ({", ".join(search_summary)})',
+                                                        'relevance_score': 0.98,
+                                                        'context_relevance': 0.95,
+                                                        'matched_concepts': ['판례', '이론', '법리', '가이드라인', '정밀검색'],
+                                                        'summary': refined_answer[:200] + '...',
+                                                        'metadata': {
+                                                            'source': 'gemini_file_search_comprehensive',
+                                                            'source_files': [s.get('title', '') for s in refined_sources if s.get('title')],
+                                                            'query_case': case_query,
+                                                            'query_theory': theory_query,
+                                                            'search_type': 'comprehensive_analysis_based',
+                                                            'has_cases': bool(case_answer and len(case_answer) > 200),
+                                                            'has_theory': bool(theory_answer and len(theory_answer) > 200)
+                                                        }
+                                                    }
+
+                                                    # 정밀 검색 결과를 맨 앞에 추가 (가장 관련성 높음)
+                                                    theoretical_results.insert(0, refined_case)
+                                                    st.session_state.theoretical_results = theoretical_results
+
+                                                    st.success(f"✅ 분석 결과 기반 정밀 검색 완료: {', '.join(search_summary)}")
+
+                                                    # 미리보기
+                                                    with st.expander("🎯 정밀 검색 결과 미리보기 (판례 + 이론)", expanded=True):
+                                                        st.markdown(f"**{refined_case['topic']}**")
+                                                        st.markdown(f"📄 {refined_answer[:500]}...")
+
+                                                        # 출처 파일 표시
+                                                        unique_sources = list(set([s for s in refined_case['metadata']['source_files'] if s]))
+                                                        if unique_sources:
+                                                            st.markdown(f"📁 출처: {', '.join(unique_sources[:5])}")
+
+                                                        # 검색 유형 표시
+                                                        if refined_case['metadata']['has_cases']:
+                                                            st.markdown("✓ 판례 및 재의·제소 사례 포함")
+                                                        if refined_case['metadata']['has_theory']:
+                                                            st.markdown("✓ 이론적 근거 및 법리 해설 포함")
+                                                else:
+                                                    st.info("ℹ️ 정밀 검색에서 추가 판례를 찾지 못했습니다.")
+
+                                            except Exception as e:
+                                                st.warning(f"⚠️ 정밀 검색 중 오류 (계속 진행): {str(e)}")
+
                                     else:
                                         st.success("✅ Gemini 1차 분석에서 특별한 문제점이 발견되지 않았습니다.")
-                                        
+
                                     analysis_results.append({
                                         'model': 'Gemini (1차 분석)',
                                         'content': first_analysis
@@ -2740,150 +2663,59 @@ def main():
                                     'error': str(e)
                                 })
                         
-                        # 4단계: 문제 발견 시 복합 PKL 참고 분석 수행
+                        # 4단계: 문제 발견 시 자료 참고 분석 수행
                         relevant_guidelines = None
                         loaded_stores = []
                         enhanced_analysis = None
                         
-                        if has_problems and use_pkl_auto and first_analysis:
-                            st.info("🔍 4단계: 문제점이 발견되어 복합 PKL 파일을 참고한 보강 분석을 수행합니다...")
-                            
-                            # 🆕 4-1단계: 종합적 조례 위법성 분석 (우선 수행)
+                        if has_problems and use_auto_search and first_analysis:
+                            # 4단계: Gemini File Search를 사용한 관련 자료 검색
                             comprehensive_analysis_results = None
-                            if has_problems:  # 문제가 발견된 경우 항상 수행
-                                st.info("⚖️ 4-1단계: 모든 유형의 조례 위법 판례를 종합 검색하여 적용합니다...")
-                                
-                                try:
-                                    from comprehensive_violation_analysis import search_comprehensive_violation_cases, apply_violation_cases_to_ordinance
-                                    
-                                    vectorstore_paths = [
-                                        '3. 지방자치단체의 재의·제소 조례 모음집(Ⅸ) (1)_new_vectorstore.pkl'
-                                    ]
-                                    
-                                    # 모든 유형의 위법 사례 종합 검색
-                                    # first_analysis에서 조례 정보 추출
-                                    ordinance_articles = []
-                                    if first_analysis and 'ordinance_data' in first_analysis:
-                                        ordinance_articles = first_analysis['ordinance_data']
-                                    
-                                    violation_cases = search_comprehensive_violation_cases(ordinance_articles, vectorstore_paths, max_results=12)
-                                    
-                                    if violation_cases:
-                                        # 유형별 통계
-                                        type_counts = {}
-                                        for case in violation_cases:
-                                            v_type = case['violation_type']
-                                            type_counts[v_type] = type_counts.get(v_type, 0) + 1
-                                        
-                                        st.success(f"✅ {len(violation_cases)}개의 조례 위법 판례를 발견했습니다:")
-                                        
-                                        # 유형별 요약
-                                        type_summary = []
-                                        for v_type, count in type_counts.items():
-                                            type_summary.append(f"{v_type} ({count}개)")
-                                        st.markdown("**발견된 위법 유형**: " + ", ".join(type_summary))
-                                        
-                                        # 발견된 판례 미리보기
-                                        with st.expander("📚 발견된 조례 위법 판례", expanded=False):
-                                            for i, case in enumerate(violation_cases):
-                                                st.markdown(f"**[{i+1}] {case['violation_type']}** (유사도: {case['similarity']:.3f})")
-                                                st.markdown(f"출처: {case['source_store'].replace('.pkl', '').replace('_', ' ').title()}")
-                                                if case['legal_principle'] != "해당없음":
-                                                    st.markdown(f"법적 원칙: {case['legal_principle']}")
-                                                st.markdown(f"요약: {case['case_summary'][:150]}...")
-                                                st.markdown("---")
-                                        
-                                        # 판례를 현재 조례에 적용하여 종합 위법성 분석
-                                        comprehensive_analysis_results = apply_violation_cases_to_ordinance(
-                                            violation_cases, pdf_text, superior_laws_content
-                                        )
-                                        
-                                        if comprehensive_analysis_results and isinstance(comprehensive_analysis_results, list):
-                                            total_risks = sum(len(result['violation_risks']) for result in comprehensive_analysis_results)
-                                            st.warning(f"⚠️ {len(comprehensive_analysis_results)}개 조문에서 총 {total_risks}개의 위법 위험이 발견되었습니다!")
-                                            
-                                            with st.expander("🚨 종합 위법성 분석 결과", expanded=True):
-                                                for result in comprehensive_analysis_results:
-                                                    st.error(f"**{result['ordinance_article']}**")
-                                                    st.markdown(f"조문 내용: {result['ordinance_content'][:100]}...")
-                                                    
-                                                    for i, risk in enumerate(result['violation_risks'][:3]):  # 상위 3개만 표시
-                                                        st.markdown(f"**위험 {i+1}: {risk['violation_type']}**")
-                                                        st.markdown(f"- 위험도: {risk['risk_score']:.2f}/1.0")
-                                                        if risk['legal_principle'] != "해당없음":
-                                                            st.markdown(f"- 법적 원칙: {risk['legal_principle']}")
-                                                        st.markdown(f"- 관련 사례: {risk['case_summary'][:100]}...")
-                                                        st.markdown(f"- 개선 권고: {risk['recommendation']}")
-                                                        st.markdown("")
-                                                    
-                                                    if len(result['violation_risks']) > 3:
-                                                        st.markdown(f"*...외 {len(result['violation_risks']) - 3}개 추가 위험*")
-                                                    st.markdown("---")
-                                        else:
-                                            st.success("✅ PKL 검색 결과 직접적인 위법 위험은 발견되지 않았습니다.")
-                                    else:
-                                        st.warning("관련 위법 판례를 찾지 못했습니다.")
-                                        
-                                except ImportError:
-                                    st.error("종합 위법성 분석 모듈을 불러올 수 없습니다.")
-                                except Exception as e:
-                                    st.error(f"종합 위법성 분석 오류: {str(e)}")
-                            
-                            # 4-2단계: 기존의 일반적인 PKL 검색
+
                             # 발견된 문제점을 기반으로 구체적인 검색 쿼리 생성
                             search_terms = []
-                            
+
                             # 사무 관련 문제
                             if any(word in first_analysis for word in ["소관사무", "사무구분", "위임사무", "자치사무"]):
                                 search_terms.extend(["기관위임사무 조례제정 불가", "위임사무 조례 제정 한계"])
-                            
-                            # 법령 위반 관련 문제  
+
+                            # 법령 위반 관련 문제
                             if any(word in first_analysis for word in ["법령 위반", "상위법령", "법령우위", "위반"]):
                                 search_terms.extend(["법령 위반 조례 사례", "상위법령 충돌 조례"])
-                            
+
                             # 조례 제정 한계 관련
                             if any(word in first_analysis for word in ["제정 한계", "입법한계", "불가", "위법"]):
                                 search_terms.extend(["조례 제정 한계 판례", "위법 조례 제정 사례"])
-                            
+
                             # 기본 검색어가 없으면 일반적인 검색어 사용
                             if not search_terms:
                                 search_terms = ["법령 위반 조례 판례", "조례 제정 한계 사례"]
-                            
+
                             # 여러 검색어 중 하나 선택 (가장 구체적인 것)
-                            search_query_pkl = search_terms[0] if search_terms else "위법 조례 판례"
-                            
-                            # 향상된 복합 벡터스토어 검색 수행
-                            try:
-                                from enhanced_search import enhanced_legal_search
-                                vectorstore_paths = [
-                                    '3. 지방자치단체의 재의·제소 조례 모음집(Ⅸ) (1)_new_vectorstore.pkl'
-                                ]
-                                enhanced_results = enhanced_legal_search(search_query_pkl, vectorstore_paths, max_results=6)
-                                
-                                # 기존 형식으로 변환
+                            search_query = search_terms[0] if search_terms else "위법 조례 판례"
+
+                            # Gemini File Search 사용
+                            if st.session_state.gemini_store_manager:
+                                try:
+                                    relevant_guidelines = search_relevant_guidelines_gemini(
+                                        query=search_query,
+                                        api_key=gemini_api_key,
+                                        store_manager=st.session_state.gemini_store_manager,
+                                        top_k=8
+                                    )
+                                    loaded_stores = ["Gemini File Search (통합 저장소)"]
+
+                                    if relevant_guidelines:
+                                        st.success(f"✅ {len(relevant_guidelines)}개의 관련 자료를 발견했습니다")
+
+                                except Exception as e:
+                                    st.error(f"Gemini 검색 오류: {e}")
+                                    relevant_guidelines = []
+                                    loaded_stores = []
+                            else:
+                                st.warning("⚠️ Gemini File Search가 초기화되지 않았습니다. API 키를 확인해주세요.")
                                 relevant_guidelines = []
-                                loaded_stores = set()
-                                
-                                for result in enhanced_results:
-                                    relevant_guidelines.append({
-                                        'text': result['text'],
-                                        'similarity': result['similarity'],
-                                        'distance': 1 - result['similarity'],
-                                        'metadata': result['metadata'],
-                                        'source_store': result['source_store'].replace('.pkl', '').replace('_', ' ').title(),
-                                        'source_file': result['source_store']
-                                    })
-                                    loaded_stores.add(result['source_store'].replace('.pkl', '').replace('_', ' ').title())
-                                
-                                loaded_stores = list(loaded_stores)
-                                
-                            except ImportError:
-                                # 기존 방식으로 폴백
-                                relevant_guidelines, loaded_stores = search_multiple_vectorstores(
-                                    search_query_pkl, 
-                                    api_key=gemini_api_key, 
-                                    top_k_per_store=2
-                                )
+                                loaded_stores = []
                             
                             if relevant_guidelines and loaded_stores:
                                 st.success(f"✅ {len(loaded_stores)}개 자료에서 {len(relevant_guidelines)}개 관련 내용을 검색했습니다:")
@@ -2925,21 +2757,20 @@ def main():
                                         if enhanced_response and hasattr(enhanced_response, 'text') and enhanced_response.text:
                                             enhanced_analysis = enhanced_response.text
                                             analysis_results.append({
-                                                'model': f'Gemini (복합PKL 보강분석 - {len(loaded_stores)}개 자료)',
+                                                'model': f'Gemini (자료 참고 보강분석 - {len(loaded_stores)}개 자료)',
                                                 'content': enhanced_analysis
                                             })
                                     except Exception as e:
-                                        st.error(f"복합 PKL 보강 분석 오류: {str(e)}")
+                                        st.error(f"자료 참고 보강 분석 오류: {str(e)}")
                             else:
                                 st.info("문제점과 관련된 자료를 찾지 못했습니다.")
                         elif not has_problems:
-                            st.info("✅ 문제점이 발견되지 않아 PKL 참고를 건너뜁니다.")
-                        elif not use_pkl_auto:
-                            st.info("🔄 PKL 자동 참고 기능이 비활성화되어 있습니다.")
+                            st.info("✅ 문제점이 발견되지 않아 자료 검색을 건너뜁니다.")
+                        elif not use_auto_search:
+                            st.info("🔄 자동 참고 자료 검색 기능이 비활성화되어 있습니다.")
                         
                         # 5단계: OpenAI 추가 분석 (선택사항)
                         if openai_api_key:
-                            st.info("🔄 5단계: OpenAI 추가 분석을 수행합니다...")
                             try:
                                 openai.api_key = openai_api_key
                                 # 가장 완전한 프롬프트로 OpenAI 분석
@@ -2986,9 +2817,9 @@ def main():
                             if has_problems and relevant_guidelines and loaded_stores:
                                 st.success(f"🎯 **복합 자료 보강 분석 완료**: 문제점 탐지 → {len(loaded_stores)}개 자료 참고 → 보강 분석")
                             elif has_problems and relevant_guidelines:
-                                st.success("🎯 **지능형 분석 완료**: 문제점 탐지 → PKL 참고 → 보강 분석")
+                                st.success("🎯 **지능형 분석 완료**: 문제점 탐지 → 자료 검색 → 보강 분석")
                             elif has_problems:
-                                st.info("⚠️ **문제점 탐지 분석 완료**: PKL 참고 없이 기본 분석만 수행")
+                                st.info("⚠️ **문제점 탐지 분석 완료**: 자료 검색 없이 기본 분석만 수행")
                             else:
                                 st.success("✅ **기본 분석 완료**: 특별한 문제점이 발견되지 않음")
                             
@@ -3008,44 +2839,44 @@ def main():
                                 if relevant_guidelines:
                                     st.markdown(f"**📚 참고된 가이드라인**: {len(relevant_guidelines)}개")
                             
-                            # 최종 보고서만 표시 (PKL 보강 분석 또는 OpenAI 분석)
+                            # 최종 보고서만 표시 (자료 참고 보강 분석 또는 OpenAI 분석)
                             final_report = None
-                            
-                            # 우선순위: 복합PKL 보강분석 > PKL 보강분석 > OpenAI 추가 분석 > 1차 분석
+
+                            # 우선순위: 자료 참고 보강분석 > OpenAI 추가 분석 > 1차 분석
                             for result in reversed(analysis_results):  # 역순으로 최신 결과 우선
                                 if 'error' not in result:
-                                    if "복합PKL 보강분석" in result['model']:
+                                    if "자료 참고 보강분석" in result['model']:
                                         final_report = result
                                         break
-                                    elif "PKL 보강" in result['model'] or "OpenAI" in result['model']:
+                                    elif "자료 참고" in result['model'] or "OpenAI" in result['model']:
                                         final_report = result
                                         break
-                            
-                            # PKL 보강이나 OpenAI가 없으면 1차 분석 사용
+
+                            # 자료 참고나 OpenAI가 없으면 1차 분석 사용
                             if not final_report:
                                 for result in analysis_results:
                                     if 'error' not in result and "1차 분석" in result['model']:
                                         final_report = result
                                         break
-                            
+
                             # 최종 보고서 표시
                             if final_report:
                                 st.markdown("### 📋 최종 분석 보고서")
-                                
+
                                 # 보고서 타입 표시
-                                if "복합PKL 보강분석" in final_report['model']:
-                                    st.success("🎯 **복합 자료 참고 보강 분석 결과**")
+                                if "자료 참고 보강분석" in final_report['model']:
+                                    st.success("🎯 **자료 참고 보강 분석 결과**")
                                     st.caption(f"📚 **활용 모델**: {final_report['model']}")
-                                elif "PKL 보강" in final_report['model']:
-                                    st.success("🎯 **PKL 가이드라인 참고 보강 분석 결과**")
+                                elif "자료 참고" in final_report['model']:
+                                    st.success("🎯 **참고 자료 기반 보강 분석 결과**")
                                 elif "OpenAI" in final_report['model']:
                                     st.info("📊 **OpenAI 추가 분석 결과**")
                                 else:
                                     st.info("🤖 **Gemini 기본 분석 결과**")
-                                
+
                                 # 보고서 내용
                                 st.markdown(final_report['content'])
-                                
+
                             # 오류 메시지만 별도 표시
                             for result in analysis_results:
                                 if 'error' in result:
@@ -3064,7 +2895,7 @@ def main():
                                     stores_count = len(loaded_stores)
                                     filename_prefix = f"복합자료보강분석({stores_count}개자료)" if is_first_ordinance else f"조례비교_복합자료분석({stores_count}개자료)"
                                 elif has_problems and relevant_guidelines:
-                                    filename_prefix = "지능형PKL보강분석" if is_first_ordinance else "조례비교_PKL보강분석"
+                                    filename_prefix = "자료참고보강분석" if is_first_ordinance else "조례비교_자료분석"
                                 elif has_problems:
                                     filename_prefix = "문제점탐지분석" if is_first_ordinance else "조례비교_문제점분석"
                                 else:

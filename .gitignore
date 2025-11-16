@@ -51,6 +51,9 @@ Thumbs.db
 .env
 config.ini
 
+# Claude Code settings (개인 설정)
+.claude/
+
 # Temporary files
 temp/
 tmp/
