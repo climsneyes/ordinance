@@ -46,10 +46,12 @@ Thumbs.db
 
 # Streamlit
 .streamlit/
+.streamlit/secrets.toml
 
 # API Keys
 .env
 config.ini
+**/secrets.toml
 
 # Claude Code settings (개인 설정)
 .claude/

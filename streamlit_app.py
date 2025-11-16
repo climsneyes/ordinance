@@ -134,6 +134,272 @@ if 'use_gemini_search' not in st.session_state:
 if 'gemini_store_manager' not in st.session_state:
     st.session_state.gemini_store_manager = None
 
+# Ollama Cloud 관련 session state
+if 'use_ollama_cloud' not in st.session_state:
+    st.session_state.use_ollama_cloud = True  # 기본값: Ollama Cloud 사용 (무료)
+if 'ollama_api_key' not in st.session_state:
+    # secrets에서 API 키 로드
+    st.session_state.ollama_api_key = st.secrets.get("OLLAMA_API_KEY", "")
+
+# RAG 벡터스토어 관련 session state
+if 'rag_vectorstores' not in st.session_state:
+    st.session_state.rag_vectorstores = None
+if 'rag_loaded' not in st.session_state:
+    st.session_state.rag_loaded = False
+
+def load_rag_vectorstores():
+    """PKL 파일에서 RAG 벡터스토어 로드"""
+    import pickle
+
+    if st.session_state.rag_loaded:
+        return st.session_state.rag_vectorstores
+
+    vectorstores = {}
+
+    # 자치법규 매뉴얼 벡터스토어
+    manual_path = "enhanced_vectorstore_20250914_101739.pkl"
+    if os.path.exists(manual_path):
+        try:
+            with open(manual_path, 'rb') as f:
+                vectorstores['manual'] = pickle.load(f)
+            st.success(f"✅ 자치법규 매뉴얼 로드 완료")
+        except Exception as e:
+            st.warning(f"⚠️ 자치법규 매뉴얼 로드 실패: {e}")
+
+    # 재의·제소 조례 모음집 벡터스토어
+    cases_path = "3. 지방자치단체의 재의·제소 조례 모음집(Ⅸ) (1)_new_vectorstore.pkl"
+    if os.path.exists(cases_path):
+        try:
+            with open(cases_path, 'rb') as f:
+                vectorstores['cases'] = pickle.load(f)
+            st.success(f"✅ 재의·제소 판례 모음집 로드 완료")
+        except Exception as e:
+            st.warning(f"⚠️ 재의·제소 판례 모음집 로드 실패: {e}")
+
+    st.session_state.rag_vectorstores = vectorstores
+    st.session_state.rag_loaded = True
+    return vectorstores
+
+def search_rag_context(query, vectorstores, top_k=5):
+    """RAG 벡터스토어에서 관련 문서 검색"""
+    results = []
+
+    # 품질 필터 함수: 목차/제목만 있는 청크 제외
+    def is_quality_content(text):
+        """유용한 내용인지 판단"""
+        # 최소 길이 체크 (100자 미만은 목차일 가능성 높음)
+        if len(text) < 100:
+            return False
+
+        # 목차/제목 패턴 감지
+        toc_patterns = [
+            r'^제\d+장\s+',  # 제1장
+            r'^제\d+절\s+',  # 제1절
+            r'^\d+\.\s+\w+\s*$',  # 1. 제목
+            r'^[가-힣]+\s+\d+$',  # 목차 번호
+            r'^\s*목\s*차\s*$',  # 목차
+            r'^\s*차\s*례\s*$',  # 차례
+        ]
+
+        for pattern in toc_patterns:
+            if re.search(pattern, text.strip(), re.MULTILINE):
+                # 패턴이 있어도 내용이 충분히 있으면 허용
+                if len(text) > 300:
+                    return True
+                return False
+
+        # 문장 완성도 체크: 마침표가 3개 이상 있어야 함 (설명이 있는 텍스트)
+        sentence_count = text.count('.') + text.count('다.') + text.count('함.')
+        if sentence_count < 2:
+            return False
+
+        # 실제 법률 용어나 설명이 포함되어 있는지
+        useful_keywords = ['판단', '해석', '따라서', '경우', '규정', '위반', '적법', '위법', '검토', '사례', '판례']
+        has_useful_content = any(kw in text for kw in useful_keywords)
+
+        return has_useful_content or len(text) > 500
+
+    for store_name, store_data in vectorstores.items():
+        try:
+            # 벡터스토어 형식에 따라 검색 수행
+            if isinstance(store_data, dict):
+                # chunks 키가 있는 경우 (우선 사용)
+                if 'chunks' in store_data:
+                    chunks = store_data['chunks']
+                    query_keywords = [kw.lower() for kw in query.split() if len(kw) > 1]
+
+                    scored_chunks = []
+                    for chunk in chunks:
+                        if isinstance(chunk, dict) and 'text' in chunk:
+                            text = chunk['text']
+                        elif isinstance(chunk, str):
+                            text = chunk
+                        else:
+                            continue
+
+                        # 품질 필터: 유용한 내용인지 체크
+                        if not is_quality_content(text):
+                            continue
+
+                        # 키워드 매칭 점수 계산
+                        text_lower = text.lower()
+                        keyword_score = sum(1 for kw in query_keywords if kw in text_lower)
+
+                        # 내용 밀도 보너스: 긴 텍스트에 보너스 점수
+                        length_bonus = min(len(text) / 500, 3.0)  # 최대 3점 보너스
+
+                        # 법률 분석 키워드 보너스
+                        analysis_keywords = ['판단', '검토', '위법', '적법', '사례', '판례', '해석', '기준']
+                        analysis_bonus = sum(0.5 for kw in analysis_keywords if kw in text)
+
+                        total_score = keyword_score + length_bonus + analysis_bonus
+
+                        if keyword_score > 0:
+                            scored_chunks.append((text, total_score))
+
+                    # 상위 결과 선택
+                    scored_chunks.sort(key=lambda x: x[1], reverse=True)
+                    for text, score in scored_chunks[:top_k]:
+                        results.append({
+                            'source': store_name,
+                            'text': text[:2000],  # 최대 2000자
+                            'score': score
+                        })
+
+                # texts 키가 있는 경우
+                elif 'texts' in store_data:
+                    texts = store_data['texts']
+                    query_keywords = [kw.lower() for kw in query.split() if len(kw) > 1]
+
+                    scored_texts = []
+                    for text in texts:
+                        if isinstance(text, str):
+                            text_lower = text.lower()
+                            score = sum(1 for kw in query_keywords if kw in text_lower)
+                            if score > 0:
+                                scored_texts.append((text, score))
+
+                    scored_texts.sort(key=lambda x: x[1], reverse=True)
+                    for text, score in scored_texts[:top_k]:
+                        results.append({
+                            'source': store_name,
+                            'text': text[:2000],
+                            'score': score
+                        })
+
+                # documents 키가 있는 경우
+                elif 'documents' in store_data:
+                    docs = store_data['documents']
+                    query_keywords = [kw.lower() for kw in query.split() if len(kw) > 1]
+
+                    scored_docs = []
+                    for doc in docs:
+                        if isinstance(doc, dict):
+                            text = doc.get('text', doc.get('content', ''))
+                        elif isinstance(doc, str):
+                            text = doc
+                        else:
+                            continue
+
+                        text_lower = text.lower()
+                        score = sum(1 for kw in query_keywords if kw in text_lower)
+                        if score > 0:
+                            scored_docs.append((text, score))
+
+                    scored_docs.sort(key=lambda x: x[1], reverse=True)
+                    for text, score in scored_docs[:top_k]:
+                        results.append({
+                            'source': store_name,
+                            'text': text[:2000],
+                            'score': score
+                        })
+            elif hasattr(store_data, 'similarity_search'):
+                # LangChain 스타일 벡터스토어
+                docs = store_data.similarity_search(query, k=top_k)
+                for doc in docs:
+                    results.append({
+                        'source': store_name,
+                        'text': doc.page_content[:2000],
+                        'score': 1.0
+                    })
+        except Exception as e:
+            st.warning(f"⚠️ {store_name} 검색 중 오류: {e}")
+
+    # 점수순 정렬
+    results.sort(key=lambda x: x.get('score', 0), reverse=True)
+    return results[:top_k * 2]  # 최대 top_k * 2개 반환
+
+def call_ollama_cloud_api(prompt, model="gpt-oss:120b-cloud", max_chars=100000):
+    """Ollama Cloud API를 호출하여 텍스트 생성
+
+    Args:
+        prompt: 분석 프롬프트
+        model: 사용할 모델 (기본: gpt-oss:120b-cloud)
+        max_chars: 최대 문자 수 (기본: 100000자, 한글 기준 약 50-70K 토큰)
+    """
+    try:
+        api_key = st.session_state.ollama_api_key
+        if not api_key or api_key == "YOUR_OLLAMA_API_KEY_HERE":
+            st.error("Ollama Cloud API 키가 설정되지 않았습니다.")
+            return None
+
+        # 프롬프트 길이 제한 (토큰 제한 방지 - 한글은 토큰 효율이 낮음)
+        original_len = len(prompt)
+        if original_len > max_chars:
+            st.warning(f"⚠️ 프롬프트가 너무 깁니다 ({original_len:,}자). {max_chars:,}자로 자동 축소합니다.")
+            # 핵심 부분을 유지하면서 축소
+            # 앞부분(지시사항 + 조례안)과 뒷부분(분석 요청)을 유지
+            front_chars = int(max_chars * 0.4)  # 앞부분 40%
+            back_chars = int(max_chars * 0.3)   # 뒷부분 30%
+
+            prompt = (
+                prompt[:front_chars] +
+                f"\n\n... [중략: 원본 {original_len:,}자 중 {original_len - max_chars:,}자 생략됨] ...\n\n" +
+                prompt[-back_chars:]
+            )
+            st.info(f"✅ 프롬프트를 {len(prompt):,}자로 축소했습니다.")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "stream": False
+        }
+
+        response = requests.post(
+            "https://ollama.com/api/chat",
+            headers=headers,
+            json=payload,
+            timeout=180  # 타임아웃 증가 (긴 프롬프트 처리)
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            # Ollama API 응답 형식에서 텍스트 추출
+            if "message" in result and "content" in result["message"]:
+                return result["message"]["content"]
+            elif "response" in result:
+                return result["response"]
+            else:
+                st.warning(f"예상치 못한 응답 형식: {result}")
+                return str(result)
+        else:
+            st.error(f"Ollama Cloud API 오류: {response.status_code} - {response.text}")
+            return None
+
+    except requests.exceptions.Timeout:
+        st.error("Ollama Cloud API 요청 시간 초과 (120초)")
+        return None
+    except Exception as e:
+        st.error(f"Ollama Cloud API 호출 오류: {str(e)}")
+        return None
+
 def get_ordinance_detail(ordinance_id):
     """조례 상세 내용 가져오기"""
     params = {
@@ -1658,7 +1924,7 @@ def create_comparison_document(pdf_text, search_results, analysis_results, super
     # 최종 보고서가 있으면 추가
     if final_report:
         doc.add_heading(f'📋 {final_report["model"]}', level=2)
-        content = final_report['content']
+        content = final_report.get('content') or final_report.get('analysis', '')
 
         # 🆕 표 파싱 및 처리
         tables_data = parse_table_from_text(content)
@@ -1777,92 +2043,89 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        st.header("🔑 API 설정")
-        gemini_api_key = st.text_input("Gemini API 키", type="password", help="Google AI Studio에서 발급받은 API 키를 입력하세요")
-        openai_api_key = st.text_input("OpenAI API 키", type="password", help="OpenAI 플랫폼에서 발급받은 API 키를 입력하세요")
+        st.header("🤖 AI 분석 엔진")
 
-        # Gemini File Search Store Manager 초기화
-        if gemini_api_key and st.session_state.gemini_store_manager is None:
-            try:
-                st.session_state.gemini_store_manager = get_gemini_store_manager(gemini_api_key)
-                st.success("✅ Gemini File Search 초기화 완료")
-            except Exception as e:
-                st.warning(f"⚠️ Gemini File Search 초기화 실패: {e}")
+        # Ollama Cloud 상태 확인
+        ollama_available = bool(st.session_state.ollama_api_key and st.session_state.ollama_api_key != "YOUR_OLLAMA_API_KEY_HERE")
+
+        if ollama_available:
+            st.success("✅ **무료 AI 분석 서비스 활성화됨**")
+            st.info("🚀 API 키 입력 없이 바로 분석을 시작할 수 있습니다!")
+            use_ollama = st.checkbox(
+                "Ollama Cloud 사용 (무료, 권장)",
+                value=st.session_state.use_ollama_cloud,
+                help="120B 파라미터의 고성능 AI 모델을 무료로 사용합니다. API 키 발급이 필요 없습니다."
+            )
+            st.session_state.use_ollama_cloud = use_ollama
+        else:
+            st.warning("⚠️ Ollama Cloud 서비스가 설정되지 않았습니다.")
+            use_ollama = False
+            st.session_state.use_ollama_cloud = False
 
         st.markdown("---")
-        st.subheader("🔍 검색 엔진 설정")
 
-        use_gemini = st.checkbox(
-            "Gemini File Search 사용 (권장)",
-            value=st.session_state.use_gemini_search,
-            help="기존 방식 대신 Gemini File Search API를 사용합니다. 더 정확한 검색 결과를 제공합니다."
-        )
-        st.session_state.use_gemini_search = use_gemini
+        # 고급 설정 (선택적)
+        with st.expander("⚙️ 고급 설정 (선택사항)", expanded=False):
+            st.markdown("**추가 AI 서비스** (선택적으로 사용)")
+            gemini_api_key = st.text_input("Gemini API 키", type="password", help="Google AI Studio에서 발급받은 API 키를 입력하세요 (선택사항)")
+            openai_api_key = st.text_input("OpenAI API 키", type="password", help="OpenAI 플랫폼에서 발급받은 API 키를 입력하세요 (선택사항)")
 
-        if use_gemini:
-            if st.session_state.gemini_store_manager:
-                st.success("✅ Gemini File Search 활성화됨")
-            else:
-                st.warning("⚠️ Gemini API 키를 먼저 입력해주세요")
+            # Gemini File Search Store Manager 초기화
+            if gemini_api_key and st.session_state.gemini_store_manager is None:
+                try:
+                    st.session_state.gemini_store_manager = get_gemini_store_manager(gemini_api_key)
+                    st.success("✅ Gemini File Search 초기화 완료")
+                except Exception as e:
+                    st.warning(f"⚠️ Gemini File Search 초기화 실패: {e}")
 
-        st.header("🔑 API 키 설정 가이드")
+            st.markdown("---")
+            st.subheader("🔍 검색 엔진 설정")
+
+            use_gemini = st.checkbox(
+                "Gemini File Search 사용",
+                value=st.session_state.use_gemini_search if gemini_api_key else False,
+                help="기존 방식 대신 Gemini File Search API를 사용합니다. 더 정확한 검색 결과를 제공합니다.",
+                disabled=not gemini_api_key
+            )
+            st.session_state.use_gemini_search = use_gemini
+
+            if use_gemini:
+                if st.session_state.gemini_store_manager:
+                    st.success("✅ Gemini File Search 활성화됨")
+                else:
+                    st.warning("⚠️ Gemini API 키를 먼저 입력해주세요")
+
+        # 기본값 설정 (expander 외부)
+        if 'gemini_api_key' not in dir():
+            gemini_api_key = ""
+        if 'openai_api_key' not in dir():
+            openai_api_key = ""
+
+        st.header("ℹ️ 서비스 안내")
         st.markdown("""
         <div class="step-card">
-            <strong>📋 API 키 발급 및 설정 방법</strong><br>
-            조례 분석을 위한 AI 서비스 API 키를 발급받고 설정하는 방법을 안내합니다.
+            <strong>🎉 무료 AI 분석 서비스</strong><br>
+            본 서비스는 Ollama Cloud의 고성능 AI 모델(120B 파라미터)을 무료로 제공합니다.<br>
+            <strong>API 키 발급 없이 바로 사용 가능합니다!</strong>
         </div>
         """, unsafe_allow_html=True)
-        
-        # 🆕 상세한 API 키 설정 가이드
-        col1, col2 = st.columns(2)
 
-        with col1:
-            st.markdown("### 🤖 Gemini API 키 발급")
-            with st.expander("📋 단계별 가이드", expanded=False):
-                st.markdown("""
-                **1. Google AI Studio 접속**
-                - 브라우저에서 [aistudio.google.com](https://aistudio.google.com) 접속
-                - Google 계정으로 로그인
+        with st.expander("📋 추가 AI 서비스 안내 (선택사항)", expanded=False):
+            st.markdown("""
+            더 다양한 분석이 필요한 경우, 아래 서비스를 추가로 사용할 수 있습니다.
 
-                **2. API 키 생성**
-                - 좌측 메뉴에서 'API Keys' 클릭
-                - 'Create API Key' 버튼 클릭
-                - 프로젝트 선택 (없으면 새로 생성)
+            ### 🤖 Gemini API (선택사항)
+            - **용도**: Gemini File Search를 통한 정밀 검색
+            - **발급**: [aistudio.google.com](https://aistudio.google.com)
+            - **무료 할당량**: 월 1,000번 요청
 
-                **3. API 키 복사**
-                - 생성된 API 키를 복사
-                - 안전한 곳에 보관 (재확인 불가)
+            ### 🧠 OpenAI API (선택사항)
+            - **용도**: 추가 교차 검증 분석
+            - **발급**: [platform.openai.com](https://platform.openai.com)
+            - **요금**: 사용량 기반 과금
 
-                **4. 사용량 확인**
-                - 무료 할당량: 월 1,000번 요청
-                - 유료 전환 시 더 많은 사용량 제공
-
-                ⚠️ **주의**: API 키는 개인정보이므로 타인과 공유하지 마세요!
-                """)
-
-        with col2:
-            st.markdown("### 🧠 OpenAI API 키 발급")
-            with st.expander("📋 단계별 가이드", expanded=False):
-                st.markdown("""
-                **1. OpenAI 플랫폼 접속**
-                - 브라우저에서 [platform.openai.com](https://platform.openai.com) 접속
-                - OpenAI 계정 생성/로그인
-
-                **2. API 키 생성**
-                - 우상단 프로필 → 'API keys' 클릭
-                - 'Create new secret key' 버튼 클릭
-                - 키 이름 입력 후 생성
-
-                **3. 결제 정보 등록**
-                - 'Billing' 메뉴에서 결제수단 등록
-                - 사용량 한도 설정 (권장: $10-20)
-
-                **4. 요금 정보**
-                - GPT-4: 입력 토큰당 $0.03/1K, 출력 토큰당 $0.06/1K
-                - 일반적으로 분석 1회당 $0.5-2 정도 소요
-
-                💡 **팁**: 처음에는 낮은 한도로 시작하여 사용량을 확인해보세요.
-                """)
+            ⚠️ **참고**: 추가 API 키 없이도 기본 분석은 완전히 작동합니다!
+            """)
 
 
     # 메인 컨텐츠
@@ -2054,16 +2317,17 @@ def main():
 
     with tab3:
         st.header("AI 비교 분석")
-        
-        # 조건 확인 - PDF가 업로드되고 API 키가 있으면 분석 가능
+
+        # 조건 확인 - PDF가 업로드되고 AI 서비스가 사용 가능하면 분석 가능
         pdf_uploaded = st.session_state.uploaded_pdf is not None
-        has_api_key = bool(gemini_api_key or openai_api_key)
+        has_ollama = st.session_state.use_ollama_cloud and bool(st.session_state.ollama_api_key and st.session_state.ollama_api_key != "YOUR_OLLAMA_API_KEY_HERE")
+        has_api_key = bool(gemini_api_key or openai_api_key) or has_ollama
         has_search_results = bool(st.session_state.search_results)
-        
+
         if not pdf_uploaded:
             st.warning("📄 먼저 PDF 파일을 업로드해주세요.")
         elif not has_api_key:
-            st.warning("🔑 API 키를 하나 이상 입력해주세요.")
+            st.warning("🔑 AI 분석 서비스가 설정되지 않았습니다. 관리자에게 문의하세요.")
         else:
             # 검색 결과 여부에 따라 안내 메시지 표시
             if not has_search_results:
@@ -2323,7 +2587,7 @@ def main():
                                         if 'combined_content' in law_group:
                                             content_preview = law_group['combined_content'][:500] + "..." if len(law_group['combined_content']) > 500 else law_group['combined_content']
                                             with st.expander(f"📋 {base_name} ({len(law_group['combined_content']):,}자)", expanded=False):
-                                                st.text_area("본문 내용", content_preview, height=300, disabled=True)
+                                                st.text_area("본문 내용", content_preview, height=300, disabled=True, key=f"content_{base_name}_{idx}")
                                         else:
                                             # 기존 방식
                                             with st.expander(f"📋 {base_name} 계층 ({len(law_group.get('combined_articles', []))}개 조문)", expanded=False):
@@ -2368,7 +2632,7 @@ def main():
                                 try:
                                     # PDF에서 조례명 추출 (처음 10줄에서)
                                     ordinance_name = ""
-                                    import re
+                                    # re 모듈은 파일 상단에서 이미 import됨
                                     lines = pdf_text.split('\n')
                                     for line in lines[:10]:
                                         line = line.strip()
@@ -2432,23 +2696,160 @@ def main():
                                     theoretical_results = []
                                     st.session_state.theoretical_results = theoretical_results
 
-                        # Gemini 1차 분석 (문제점 탐지용)
+                        # AI 1차 분석 (문제점 탐지용) - Ollama Cloud 우선 사용
                         first_analysis = None
                         has_problems = False
-                        
-                        if gemini_api_key:
+                        analysis_model_name = ""
+                        rag_context = ""
+
+                        # Ollama Cloud를 우선적으로 사용
+                        if has_ollama:
                             try:
                                 # comprehensive_analysis_results 초기화
                                 comprehensive_analysis_results = None
-                                
+
+                                # RAG 벡터스토어 로드 및 검색
+                                with st.spinner("📚 자치법규 매뉴얼 및 판례 자료를 로드하고 있습니다..."):
+                                    vectorstores = load_rag_vectorstores()
+
+                                if vectorstores:
+                                    # 조례명 가져오기 (이전에 정의되었는지 확인)
+                                    current_ordinance_name = st.session_state.get('current_ordinance_name', '')
+                                    if not current_ordinance_name:
+                                        # PDF 텍스트에서 조례명 추출 시도
+                                        name_match = re.search(r'([가-힣\s]+(?:조례|규칙))', pdf_text[:500])
+                                        if name_match:
+                                            current_ordinance_name = name_match.group(1).strip()
+
+                                    # 조례 내용에서 잠재적 위법성 키워드 추출
+                                    potential_issues = []
+                                    ordinance_sample = pdf_text[:3000]  # 처음 3000자 분석
+
+                                    # 위법성 관련 패턴 감지
+                                    issue_patterns = {
+                                        '수수료': ['수수료', '사용료', '요금', '부담금'],
+                                        '벌칙': ['벌칙', '과태료', '과징금', '벌금', '제재'],
+                                        '권리제한': ['제한', '금지', '의무', '허가', '신고', '등록'],
+                                        '재정': ['지원', '보조금', '출연', '예산', '재정'],
+                                        '조직': ['위원회', '협의회', '심의회', '기구', '조직'],
+                                        '인사': ['임명', '위촉', '해임', '겸직', '자격'],
+                                        '위임': ['위임', '대행', '위탁', '대리'],
+                                        '주민권리': ['주민', '청구', '투표', '참여', '공개']
+                                    }
+
+                                    for issue_type, keywords in issue_patterns.items():
+                                        for keyword in keywords:
+                                            if keyword in ordinance_sample:
+                                                potential_issues.append(issue_type)
+                                                break
+
+                                    # 중복 제거
+                                    potential_issues = list(set(potential_issues))
+
+                                    # 조례 내용 기반 동적 검색 쿼리 생성
+                                    if potential_issues:
+                                        issue_keywords = ' '.join(potential_issues[:3])  # 최대 3개 이슈
+                                        search_query = f"{current_ordinance_name} {issue_keywords} 조례 위법 판단"
+                                        st.info(f"🔍 감지된 잠재적 검토 필요 사항: {', '.join(potential_issues)}")
+                                    else:
+                                        search_query = f"{current_ordinance_name} 조례 위법 판단 기준 자치사무"
+
+                                    rag_results = search_rag_context(search_query, vectorstores, top_k=5)
+
+                                    if rag_results:
+                                        st.success(f"✅ {len(rag_results)}개의 관련 자치법규 자료를 찾았습니다!")
+
+                                        # RAG 컨텍스트 구성
+                                        rag_context = "\n\n[참고 자료: 자치법규 매뉴얼 및 재의·제소 판례]\n"
+                                        for i, result in enumerate(rag_results[:5], 1):
+                                            source_name = "자치법규 매뉴얼" if result['source'] == 'manual' else "재의·제소 판례"
+                                            rag_context += f"\n--- {source_name} 참고자료 {i} ---\n"
+                                            rag_context += result['text'][:1500] + "\n"
+
+                                        rag_context += "\n[중요] 위 참고 자료를 바탕으로 실제 위법 여부를 신중하게 판단하세요. 단순히 상위법과 다르다고 해서 위법한 것이 아닙니다. 자치사무와 위임사무를 구분하고, 지방자치단체의 조례제정권 범위를 고려하세요.\n"
+
+                                        with st.expander("📖 RAG 검색 결과 미리보기", expanded=False):
+                                            for i, result in enumerate(rag_results[:5], 1):
+                                                source_name = "자치법규 매뉴얼" if result['source'] == 'manual' else "재의·제소 판례"
+                                                st.markdown(f"**{i}. {source_name}** (점수: {result.get('score', 0)})")
+                                                st.text(result['text'][:500] + "...")
+                                                st.markdown("---")
+                                    else:
+                                        st.info("RAG 검색에서 관련 자료를 찾지 못했습니다.")
+
+                                # 1차 분석용 프롬프트 생성 (RAG 컨텍스트 포함)
+                                theoretical_results = st.session_state.get('theoretical_results', None)
+                                first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results)
+
+                                # RAG 컨텍스트를 프롬프트 앞부분에 추가
+                                if rag_context:
+                                    first_prompt = rag_context + "\n\n" + first_prompt
+
+                                # Ollama Cloud 전송 프롬프트 디버깅 표시
+                                with st.expander("🔍 AI에게 전송되는 프롬프트 내용 확인", expanded=False):
+                                    st.markdown("### 프롬프트 구조 분석")
+                                    st.markdown(f"**전체 길이**: {len(first_prompt):,}자")
+                                    st.markdown(f"**사용 모델**: Ollama Cloud (gpt-oss:120b)")
+                                    if rag_context:
+                                        st.markdown(f"**RAG 컨텍스트 포함**: ✅ ({len(rag_context):,}자)")
+
+                                    # 전체 프롬프트 표시 (처음 2000자만)
+                                    st.text_area(
+                                        "전체 프롬프트 (처음 2000자)",
+                                        first_prompt[:2000] + "..." if len(first_prompt) > 2000 else first_prompt,
+                                        height=400,
+                                        key="full_prompt_ollama"
+                                    )
+
+                                with st.spinner("🤖 Ollama Cloud AI가 조례를 분석하고 있습니다..."):
+                                    response_text = call_ollama_cloud_api(first_prompt)
+
+                                if response_text:
+                                    first_analysis = response_text
+                                    analysis_model_name = "Ollama Cloud (gpt-oss:120b)"
+
+                                    # 문제점 키워드 탐지
+                                    problem_keywords = [
+                                        "위반", "문제", "충돌", "부적절", "개선", "수정", "보완",
+                                        "법령 위반", "상위법령", "위법", "불일치", "모순", "우려"
+                                    ]
+
+                                    has_problems = any(keyword in first_analysis for keyword in problem_keywords)
+
+                                    if has_problems:
+                                        st.warning(f"⚠️ AI가 잠재적 문제점을 발견했습니다!")
+
+                                    # 분석 결과 저장
+                                    analysis_results.append({
+                                        'model': 'Ollama Cloud (1차 분석)',
+                                        'analysis': first_analysis,
+                                        'has_problems': has_problems
+                                    })
+                                else:
+                                    st.error("Ollama Cloud 1차 분석 응답이 비어있습니다.")
+
+                            except Exception as e:
+                                st.error(f"Ollama Cloud 1차 분석 오류: {str(e)}")
+                                analysis_results.append({
+                                    'model': 'Ollama Cloud (1차 분석)',
+                                    'analysis': '',
+                                    'error': str(e)
+                                })
+
+                        # Gemini API가 있으면 추가 분석 (선택적)
+                        elif gemini_api_key:
+                            try:
+                                # comprehensive_analysis_results 초기화
+                                comprehensive_analysis_results = None
+
                                 genai.configure(api_key=gemini_api_key)
                                 model = genai.GenerativeModel('gemini-2.0-flash-lite')
-                                
+
                                 # 1차 분석용 프롬프트 (문제점 탐지 중심)
                                 # 검색된 판례 정보 가져오기
                                 theoretical_results = st.session_state.get('theoretical_results', None)
                                 first_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, None, is_first_ordinance, comprehensive_analysis_results, theoretical_results)
-                                
+
                                 # 🆕 Gemini 전송 프롬프트 디버깅 표시 - expander로 변경하여 재실행 방지
                                 with st.expander("🔍 Gemini에게 전송되는 프롬프트 내용 확인", expanded=False):
                                     st.markdown("### 프롬프트 구조 분석")
@@ -2501,7 +2902,7 @@ def main():
                                         with st.spinner("🔍 1차 분석 결과를 기반으로 관련 판례를 정밀 검색하고 있습니다..."):
                                             try:
                                                 # 핵심 키워드 추출 (조례명 + 구체적인 조항 제목)
-                                                import re
+                                                # re 모듈은 파일 상단에서 이미 import됨
 
                                                 # 1. 조례명이 있으면 사용
                                                 search_keywords = []
@@ -2739,8 +3140,8 @@ def main():
                                             st.markdown(guideline['text'][:200] + "..." if len(guideline['text']) > 200 else guideline['text'])
                                             st.markdown("---")
                                 
-                                # 2차 보강 분석 수행 (조용히)
-                                if gemini_api_key:
+                                # 2차 보강 분석 수행 (조용히) - Ollama Cloud 우선 사용
+                                if has_ollama:
                                     try:
                                         # 보강 분석용 프롬프트
                                         enhanced_prompt = create_analysis_prompt(
@@ -2752,7 +3153,30 @@ def main():
                                             comprehensive_analysis_results,
                                             theoretical_results
                                         )
-                                        
+
+                                        with st.spinner("🤖 AI가 참고 자료를 바탕으로 보강 분석을 수행하고 있습니다..."):
+                                            enhanced_analysis = call_ollama_cloud_api(enhanced_prompt)
+
+                                        if enhanced_analysis:
+                                            analysis_results.append({
+                                                'model': f'Ollama Cloud (자료 참고 보강분석 - {len(loaded_stores)}개 자료)',
+                                                'content': enhanced_analysis
+                                            })
+                                    except Exception as e:
+                                        st.error(f"Ollama Cloud 보강 분석 오류: {str(e)}")
+                                elif gemini_api_key:
+                                    try:
+                                        # 보강 분석용 프롬프트
+                                        enhanced_prompt = create_analysis_prompt(
+                                            pdf_text,
+                                            search_results_for_analysis,
+                                            superior_laws_content,
+                                            relevant_guidelines,
+                                            is_first_ordinance,
+                                            comprehensive_analysis_results,
+                                            theoretical_results
+                                        )
+
                                         enhanced_response = model.generate_content(enhanced_prompt)
                                         if enhanced_response and hasattr(enhanced_response, 'text') and enhanced_response.text:
                                             enhanced_analysis = enhanced_response.text
@@ -2871,11 +3295,14 @@ def main():
                                     st.success("🎯 **참고 자료 기반 보강 분석 결과**")
                                 elif "OpenAI" in final_report['model']:
                                     st.info("📊 **OpenAI 추가 분석 결과**")
+                                elif "Ollama Cloud" in final_report['model']:
+                                    st.info("🤖 **Ollama Cloud AI 분석 결과** (무료 서비스)")
                                 else:
                                     st.info("🤖 **Gemini 기본 분석 결과**")
 
-                                # 보고서 내용
-                                st.markdown(final_report['content'])
+                                # 보고서 내용 (content 또는 analysis 키 지원)
+                                report_content = final_report.get('content') or final_report.get('analysis', '')
+                                st.markdown(report_content)
 
                             # 오류 메시지만 별도 표시
                             for result in analysis_results:
