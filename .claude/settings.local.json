@@ -19,7 +19,12 @@
       "Bash(git push:*)",
       "Bash(tail:*)",
       "Bash(git rm:*)",
-      "WebFetch(domain:www.data.go.kr)"
+      "WebFetch(domain:www.data.go.kr)",
+      "Bash(git diff:*)",
+      "Bash(git checkout:*)",
+      "Bash(taskkill:*)",
+      "Bash(nul)",
+      "Bash(git log:*)"
     ],
     "deny": [],
     "ask": []
