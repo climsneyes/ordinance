@@ -19,6 +19,11 @@ import numpy as np
 import hashlib
 from typing import Dict, List
 from sklearn.metrics.pairwise import cosine_similarity
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
 # Gemini File Search 통합
 from gemini_file_search import (
@@ -347,17 +352,77 @@ def call_ollama_cloud_api(prompt, model="gpt-oss:120b-cloud", max_chars=100000):
         original_len = len(prompt)
         if original_len > max_chars:
             st.warning(f"⚠️ 프롬프트가 너무 깁니다 ({original_len:,}자). {max_chars:,}자로 자동 축소합니다.")
-            # 핵심 부분을 유지하면서 축소
-            # 앞부분(지시사항 + 조례안)과 뒷부분(분석 요청)을 유지
-            front_chars = int(max_chars * 0.4)  # 앞부분 40%
-            back_chars = int(max_chars * 0.3)   # 뒷부분 30%
 
-            prompt = (
-                prompt[:front_chars] +
-                f"\n\n... [중략: 원본 {original_len:,}자 중 {original_len - max_chars:,}자 생략됨] ...\n\n" +
-                prompt[-back_chars:]
-            )
-            st.info(f"✅ 프롬프트를 {len(prompt):,}자로 축소했습니다.")
+            # 섹션 마커를 찾아서 지능형 축소
+            # 1. 법리적 가이드라인 (최우선 보존)
+            # 2. 검토 대상 조례 원문 (필수 보존)
+            # 3. 상위법령 (부분 축소 가능)
+            # 4. RAG 참고자료 (부분 축소 가능)
+            # 5. 분석 지시사항 (필수 보존)
+
+            try:
+                # 주요 섹션 경계 찾기
+                guideline_start = prompt.find("🚨 **필독: 조례 위법 판단")
+                ordinance_start = prompt.find("📄 **[검토 대상 조례 원문 시작]**")
+                ordinance_end = prompt.find("📄 **[검토 대상 조례 원문 종료]**")
+                reference_start = prompt.find("📚 **[참고자료:")
+                reference_end = prompt.find("📚 **[참고자료 종료]**")
+                analysis_instruction_start = prompt.find("아래 기준에 따라 분석해줘")
+
+                # 필수 섹션 추출
+                guideline_section = prompt[guideline_start:ordinance_start] if guideline_start != -1 and ordinance_start != -1 else ""
+                ordinance_section = prompt[ordinance_start:ordinance_end + 100] if ordinance_start != -1 and ordinance_end != -1 else ""
+
+                # 조례 원문이 너무 길면 일부 축소 (앞부분 유지)
+                if len(ordinance_section) > max_chars * 0.4:
+                    ordinance_header = ordinance_section[:2000]  # 헤더 보존
+                    ordinance_content_limit = int(max_chars * 0.4) - 2000
+                    ordinance_section = ordinance_header + ordinance_section[2000:2000+ordinance_content_limit] + "\n\n... [조례 일부 생략] ...\n\n" + ordinance_section[-500:]
+
+                # 참고자료는 요약 (첫 5개 항목만)
+                reference_section = ""
+                if reference_start != -1 and reference_end != -1:
+                    ref_content = prompt[reference_start:reference_end + 100]
+                    # 참고자료 개수 제한
+                    ref_items = ref_content.split("[참고자료")
+                    if len(ref_items) > 6:  # 헤더 + 5개 항목
+                        reference_section = "[참고자료".join(ref_items[:6]) + "\n\n... [참고자료 일부 생략 - 위법 판단 근거로만 사용] ...\n\n📚 **[참고자료 종료]**\n" + "=" * 80 + "\n"
+                    else:
+                        reference_section = ref_content
+
+                # 분석 지시사항 (필수 완전 보존)
+                if analysis_instruction_start != -1:
+                    instruction_section = prompt[analysis_instruction_start:]  # 분석 지시사항 전체 보존
+                else:
+                    # 찾지 못하면 마지막 20% 보존 (안전장치)
+                    instruction_section = prompt[-int(max_chars * 0.2):]
+
+                # 중간 섹션 (상위법령, 타시도 조례) - 남은 공간만큼 할당
+                if ordinance_end != -1 and reference_start != -1:
+                    middle_section = prompt[ordinance_end + 100:reference_start]
+                    # 중간 섹션 크기 제한 (최대 20%)
+                    max_middle = int(max_chars * 0.2)
+                    if len(middle_section) > max_middle:
+                        middle_section = middle_section[:max_middle] + "\n\n... [상위법령/타시도 조례 일부 생략] ...\n\n"
+                else:
+                    middle_section = ""
+
+                # 재조립
+                prompt = guideline_section + ordinance_section + middle_section + reference_section + instruction_section
+
+                st.info(f"✅ 프롬프트를 {len(prompt):,}자로 축소했습니다 (필수 섹션 보존: 법리 가이드라인, 조례 원문, 분석 지시사항)")
+
+            except Exception as e:
+                # 섹션 파싱 실패 시 기존 방식 사용
+                st.warning(f"⚠️ 지능형 축소 실패, 단순 축소 적용: {str(e)}")
+                front_chars = int(max_chars * 0.5)  # 앞부분 50%
+                back_chars = int(max_chars * 0.3)   # 뒷부분 30%
+                prompt = (
+                    prompt[:front_chars] +
+                    f"\n\n... [중략: 원본 {original_len:,}자 중 {original_len - max_chars:,}자 생략됨] ...\n\n" +
+                    prompt[-back_chars:]
+                )
+                st.info(f"✅ 프롬프트를 {len(prompt):,}자로 축소했습니다.")
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -1523,18 +1588,59 @@ def analyze_ordinance_vs_superior_laws(pdf_text, superior_laws_content):
 def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None, relevant_guidelines=None, is_first_ordinance=False, comprehensive_analysis_results=None, theoretical_results=None):
     """분석 프롬프트 생성 함수"""
     prompt = (
+        "=" * 80 + "\n"
+        "⚠️ **최우선 지시사항: 검토 대상 조례 vs 참고자료 구분**\n"
+        "=" * 80 + "\n"
+        "당신은 조례 위법성 검토 전문가입니다.\n\n"
+        "**핵심 임무**:\n"
+        "1. [검토 대상 조례 원문] 섹션에 제시된 조례의 위법성을 검토\n"
+        "2. [참고자료] 섹션의 자치법규 가이드라인/판례는 **위법 판단의 근거 자료일 뿐**\n"
+        "3. **절대 참고자료를 검토 대상 조례로 착각하지 말 것**\n\n"
+        "**분석 결과 형식**:\n"
+        "- 반드시 아래 모든 섹션을 포함하여 답변:\n"
+        "  1. [비교분석 요약표(조문별)]\n"
+        "  2. [내 조례의 차별점 요약]\n"
+        "  3. [검토 시 유의사항] - a) 소관사무의 원칙, b) 법률유보의 원칙, c) 법령우위의 원칙\n"
+        "  4. [실무적 검토 포인트]\n\n"
+        "=" * 80 + "\n\n"
+        "🚨 **필독: 조례 위법 판단 법리적 가이드라인 (최우선 준수 사항)**\n\n"
+        "**1. 조례 위법 판단의 원칙**\n"
+        "- 조례는 자치입법권에 따라 폭넓은 재량을 가지며, 법률과 상충하거나 주민의 권리를 침해하지 않는 이상 위법으로 보지 않는다.\n"
+        "- 조례는 법률유보, 포괄위임금지, 절차적 위법 등 요건이 엄격할 때만 위법성이 문제된다.\n"
+        "- 단순한 표현 방식, 관행과의 차이, 타 지자체와의 비교만으로 위법 판단을 하지 않는다.\n\n"
+        "**2. 자동해산·포괄조항 등 자치단체 조례에서 흔히 쓰는 규정은 원칙적으로 허용**\n"
+        "- 특정안건형·비상설 위원회에 대한 자동 구성·자동 해산 규정은 조례가 정한 절차에 따른 것으로 보며 위법으로 판단하지 않는다.\n"
+        "- '그 밖에 시장이 필요하다고 인정하는 경우' 등 보충적 포괄조항은 권리·의무를 제한하지 않는 한 자치입법권 범위에서 허용된다.\n"
+        "- 이를 법률유보·포괄위임금지로 판단하지 않는다.\n\n"
+        "**3. 자문위원회에 대해서는 '절차권', '구성권' 개념을 적용하지 않기**\n"
+        "- 위원회는 자치단체장의 자문기구이며, 위원회 존폐는 주민의 절차권 또는 권익과 직접 관련되지 않는다.\n"
+        "- 절차권 침해, 구성권 침해 등의 개념을 자문위원회에 적용하지 않는다.\n\n"
+        "**4. 위법 판단은 반드시 '법률 상위규범과의 명확한 충돌'이 있을 때만 함**\n"
+        "- 위법 판단을 할 때는 반드시 다음을 충족할 때만 위법성을 지적한다:\n"
+        "  1) 조례가 상위법의 명령·금지를 명백히 위반하는 경우\n"
+        "  2) 주민의 권리를 제한하거나 의무를 부과하면서 법적 근거가 명확히 없는 경우\n"
+        "  3) 자치사무가 아닌 국가사무를 침해하는 경우\n"
+        "- 그 외에는 '위법 가능성 있음'이라고 판단하지 않는다.\n\n"
+        "---\n\n"
         "🚨 **중요 미션: 실제 위법 내용 찾기**\n"
         "너는 조례 위법성 전문 검토관이다. 일반적인 법리 설명이 아니라 **구체적인 위법 사항을 찾아내는 것**이 목표다.\n"
         "상위법령과 조례를 조문 대 조문으로 직접 비교하여 실제 충돌하는 부분을 찾아라.\n\n"
         "**검토 원칙:**\n"
         "- ❌ '이런 내용이 있으면 위법하다'는 일반론 금지\n"
         "- ✅ '조례 제3조는 도로교통법 제12조와 이렇게 충돌한다'는 구체적 지적 필수\n"
-        "- ✅ 의심스러운 부분도 반드시 언급\n"
+        "- ✅ 의심스러운 부분도 반드시 언급 (단, 위 가이드라인 1~4를 준수하여 신중히 판단)\n"
         "- ✅ 위법이 없으면 '위법 사항 없음'으로 명확히 결론\n\n"
-        "아래는 내가 업로드한 조례 PDF의 전체 내용이야.\n"
-        "---\n"
-        f"{pdf_text}\n"
-        "---\n"
+        "=" * 80 + "\n"
+        "📄 **[검토 대상 조례 원문 시작]**\n"
+        "=" * 80 + "\n"
+        "⚠️ **중요**: 아래 내용은 내가 업로드한 조례 PDF의 전체 내용이다.\n"
+        "이 조례의 위법성을 검토하는 것이 당신의 임무이다.\n"
+        "이 조례 이후에 제공되는 '참고자료', '가이드라인', '판례' 등은 모두 위법 판단의 근거일 뿐,\n"
+        "검토 대상 조례 본문이 아니다. 절대 혼동하지 말 것.\n\n"
+        f"{pdf_text}\n\n"
+        "=" * 80 + "\n"
+        "📄 **[검토 대상 조례 원문 종료]**\n"
+        "=" * 80 + "\n\n"
     )
     
     # 상위법령 내용 추가 (계층별 그룹화)
@@ -1593,9 +1699,16 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
     
     # 자치법규 가이드라인 및 사례 추가
     if relevant_guidelines:
-        prompt += "\n그리고 아래는 자치법규 관련 자료에서 검색된 관련 내용이야.\n"
-        prompt += "**중요**: 소관사무의 원칙, 법률유보의 원칙, 법령우위의 원칙 등 부분에 있어 조금이라도 문제가 될 것 같은 부분이 있다면,\n"
-        prompt += "아래 자료에 수록된 예전에 문제가 되었던 사례와 검토 기준을 자세히 참조해서 보고서를 작성해줘.\n"
+        prompt += "\n" + "=" * 80 + "\n"
+        prompt += "📚 **[참고자료: 자치법규 가이드라인 및 위법 판단 기준]**\n"
+        prompt += "=" * 80 + "\n"
+        prompt += "⚠️ **중요 주의사항**: 아래 내용은 위법성 판단을 위한 **참고자료일 뿐**이다.\n"
+        prompt += "**이것은 검토 대상 조례가 아니다.** 위에서 제시한 [검토 대상 조례 원문]과 혼동하지 말 것.\n"
+        prompt += "아래는 자치법규 매뉴얼, 예전 위법 사례, 판례 등에서 검색된 관련 내용으로,\n"
+        prompt += "위 조례의 위법성을 판단할 때 **근거 자료로만 활용**하라.\n\n"
+        prompt += "**활용 방법**: 소관사무의 원칙, 법률유보의 원칙, 법령우위의 원칙 등 부분에 있어\n"
+        prompt += "위 조례에서 조금이라도 문제가 될 것 같은 부분이 있다면,\n"
+        prompt += "아래 자료에 수록된 예전에 문제가 되었던 사례와 검토 기준을 참조하여 판단하라.\n"
         prompt += "---\n"
         
         # 소스별로 그룹화하여 표시
@@ -1607,12 +1720,14 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
             source_groups[source_store].append(guideline)
         
         for source_store, guidelines in source_groups.items():
-            prompt += f"◆ 참고자료: {source_store}\n"
+            prompt += f"◆ 참고자료 출처: {source_store}\n"
             for i, guideline in enumerate(guidelines):
                 similarity_score = guideline.get('similarity', 1-guideline.get('distance', 0))
-                prompt += f"  [{i+1}] (유사도: {similarity_score:.3f})\n"
+                prompt += f"  [참고자료 {i+1}] (유사도: {similarity_score:.3f})\n"
                 prompt += f"  {guideline['text']}\n\n"
         prompt += "---\n"
+        prompt += "📚 **[참고자료 종료]**\n"
+        prompt += "=" * 80 + "\n\n"
     
     # 종합 위법성 판례 분석 결과 추가
     if comprehensive_analysis_results and isinstance(comprehensive_analysis_results, list) and len(comprehensive_analysis_results) > 0:
@@ -1686,59 +1801,69 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
         "3. [검토 시 유의사항] (별도 소제목)\n"
         "각 항목마다 일반인도 이해할 수 있도록 쉬운 말로 부연설명도 함께 작성해줘.\n"
         "다음 원칙들을 기준으로 검토해줘:\n"
-        "a) 소관사무의 원칙 - **🚨 매우 중요: 기관위임사무는 조례 제정 금지**\n"
-        "**기관위임사무 정의**: 국가사무를 지방자치단체의 '장'(시장, 군수, 구청장)에게 위임한 사무\n"
+        "a) 소관사무의 원칙 - *기관위임사무는 조례 제정 금지**\n"
+        " 자치사무의 예시는 지방자치법 제13조제2항에 열거 되어 있음**\n"
+        " 개별 법령에서 국가 또는 중앙행정기관의 장을 권한 주체로 정하고 있는 경우 국가사무로 보아야 함. 국가사무에 관한 사항을 규정한 조례는 위법. 국가사무 여부를 판단함에 있어서 지방자치법 제15조를 고려할 수 있음. 다만, 법령에서 일정 사항을 조례로 정할 수 있다고 규정한다면 그 사무가 국가사무나 자치사무 관계없이 조례 제정 가능**\n"
+        " 지방자치단체 또는 지방자치단체의 장을 권한주체로 정하고 있는 경우 자치사무로 보아야 함**\n"
+        " 법령에 국가와 지방자치단체를 사무 수행의 주체로 병렬적으로 규정하는 경우 국가사무와 자치사무 성질을 모두 가지므로 조례로 규율 가능능**\n"
+        "**기관위임사무 정의**: 국가사무를 지방자치단체장(특별시장, 도지사, 광역시장, 시장, 군수, 구청장)에게 위임한 사무, 조례에서 위임한게 아니고 법률, 시행령, 시행규칙에서 위임한 것을 말함\n"
         "**핵심 원칙**: 기관위임사무에 대해서는 조례 제정이 원칙적으로 금지됨 (지방자치법 제22조)\n"
         "**판별 기준**: \n"
         "  1) 사무가 국가사무인지 확인 (예: 건축허가, 도시계획, 환경영향평가 등)\n"
-        "  2) 해당 사무가 지방자치단체 '장'에게 위임되었는지 확인\n"
-        "  3) 위임된 사무에 대해 조례가 별도 규정을 두고 있는지 검토\n"
+        "  2) 해당 사무가 지방자치단체장(특별시장, 도지사, 광역시장, 시장, 군수, 구청장)에게 위임되었는지 확인\n"
+        "  3) 자치사무인지 기관위임사무인지 판단함에 있어 법령의 규정형식과 취지를 우선 고려해야 할것이나 그 외에도 사무의 성질이 전국적으로 통일적인 처리를 요구하는 사무인지 경비부담과 최종적인 책임귀속 주체등도 고려해 판단\n"
         "**위법 사례**: 건축허가, 개발행위허가, 환경영향평가 등 국가위임사무에 대해 조례로 추가 규정을 둔 경우\n"
         "- 지방자치단체의 자치사무와 법령에 의해 위임된 단체위임사무에 대해서만 제정 가능한지\n"
         "- 사무의 성격이 전국적으로 통일적 처리를 요구하는지 여부 검토\n\n"
         "b) 법률 유보의 원칙\n"
-        "- 주민의 권리를 제한하거나 의무를 부과하는 내용이 있는지\n"
-        "- 상위 법령에서 위임받지 않은 권한을 행사하는지\n"
-        "- 상위 법령의 위임 범위를 초과하는지\n\n"
-        "c) 법령우위의 원칙 위반 여부 \n"
-        "- **🚨 매우 중요: 실제 위법 내용을 찾아내는 것이 목표**\n"
-        "- **일반론이 아닌 구체적 충돌 지점을 반드시 찾아라**\n"
-        "- 위에 제시된 상위법령 본문을 한 조문씩 꼼꼼히 읽고 조례와 직접 대조하라\n\n"
-        "**⚠️ 중요: 실질적 위법성 판단 기준**\n"
-        "형식적 문언 비교만으로 위법 판단을 하지 말 것! 실무와 판례에서 통용되는 다음 기준을 적용하라:\n\n"
-        "**✅ 실제 위법이 아닌 경우 (과도한 지적 금지)**:\n"
-        "1) **예산 범위 내 지원 조항**: '예산 범위에서 지원할 수 있다'는 조문은 지방재정법 제17조 위반이 아님\n"
-        "   - 이유: 조례 자체가 지출근거이며, 예산 편성 시 구체적 내용이 결정됨\n"
-        "   - 판례: 대법원 2002두8350, 대법원 2012두4738 참조\n\n"
-        "2) **위임에 따른 구체화**: 상위법이 '필요한 사항은 조례로 정한다'고 위임한 경우\n"
-        "   - 조례가 위임 범위 내에서 구체적 기준을 정하는 것은 적법\n"
-        "   - 예: 지원 대상, 절차, 방법 등의 세부사항 규정\n\n"
-        "3) **보충적 규정**: 상위법이 금지하지 않고, 자치사무 범위 내에서 추가 규정을 두는 경우\n"
-        "   - 상위법의 목적과 취지에 반하지 않는 한 적법\n"
-        "   - 예: 상위법이 정한 기준에 추가하여 지역 특성을 반영한 규정\n\n"
-        "4) **절차적 규정**: 상위법이 실체적 내용만 정하고, 집행 절차를 조례에 위임한 경우\n"
-        "   - 신청 방법, 심사 절차, 제출 서류 등 절차 규정은 조례 제정 가능\n\n"
-        "**🚨 실제 위법인 경우 (반드시 지적해야 할 사항)**:\n"
-        "1) **직접적 모순**: 상위법이 명시적으로 금지하는 것을 조례가 허용하거나, 그 반대의 경우\n"
-        "2) **권한 침해**: 상위법이 국가 또는 중앙행정기관의 전속 권한으로 정한 사항을 조례가 규율\n"
-        "3) **위임 범위 일탈**: 상위법의 위임 범위를 명백히 초과하거나 위임 취지에 반하는 경우\n"
-        "4) **과도한 권리 제한**: 상위법보다 현저히 강한 의무나 제재를 부과하는 경우\n"
-        "5) **전국적 통일성 침해**: 전국적으로 통일적 처리가 필요한 사항에 대해 다른 기준을 정하는 경우\n\n"
+        "- 주민의 권리를 제한하거나 의무를 부과에 관한 사항이나 벌칙을 정할 때에는 법률의 위임이 있어야 함\n"
+        "- 상위 법령에서 위임받지 않은 권한을 행사하는지 확인 (단, 권리·의무를 제한하지 않는 조직·절차 규정은 제외)\n"
+        "- 상위 법령의 위임 범위를 명백히 초과하는지 검토\n\n"
+        "**⚠️ 중요: 포괄조항에 대한 올바른 판단 기준**\n"
+        "- '그 밖에 시장이 필요하다고 인정하는 경우' 등 보충적 포괄조항은:\n"
+        "  ① 주민의 권리·의무를 직접 제한하지 않고\n"
+        "  ② 자치단체의 자문·심의기구 운영에 관한 사항이며\n"
+        "  ③ 다른 지자체 조례에서도 흔히 사용되는 경우\n"
+        "  → **원칙적으로 적법한 규정으로 판단**\n"
+        "- 타 지자체 조례에 유사 조항이 다수 존재한다면 이는 조례 관행으로 인정되므로 위법으로 보지 않음\n"
+        "- 법률유보 위반으로 판단하기 위해서는 '주민의 권리 제한 또는 의무 부과'라는 요건이 반드시 충족되어야 함\n\n"
+        "c) 법령우위의 원칙 위반 여부\n"
+        "- **조례가 법령에 위반되는지 여부는 법령과 조례의 각각의 규정 취지, 규정의 목적과 내용 및 효과 등을 비교하여 양자 사이에 모순, 저촉이 있는지 여부에 따라 개별적, 구체적으로 결정해야 함**\n"
+        "- **일반론이 아닌 구체적 충돌 지점을 찾을 것 - 단순히 '다르다'는 것만으로는 위법이 아님**\n"
+        "- '다른 조례에 특별 규정이 없으면 본 조례가 우선'이라는 규정은 다른 조례와 비교했을 때 우선한다는 것이지 상위법령보다 우선한다는 것이 아니기 때문에 적법함\n"
+        "- 위에 제시된 상위법령 본문을 한 조문씩 꼼꼼히 읽고 조례와 대조할 것\n\n"
+        "**⚠️ 중요: 자치단체 위원회·자문기구 운영 규정에 대한 판단 기준**\n"
+        "- 자치단체가 설치하는 각종 위원회, 자문기구, 협의체 등의 구성·운영에 관한 사항은:\n"
+        "  ① 자치단체의 내부 조직·절차에 관한 사항으로서\n"
+        "  ② 주민의 권리·의무와 직접 관련이 없고\n"
+        "  ③ 자치입법권의 핵심 영역에 해당하므로\n"
+        "  → **상위법에 명시적 금지 규정이 없는 한 원칙적으로 적법**\n"
+        "- 특정안건형 위원회의 자동 구성·자동 해산 조항은 조례 제정권의 범위 내에서 허용됨\n"
+        "- '절차권 침해', '구성권 침해' 등의 개념은 주민의 권익과 직접 관련된 경우에만 적용되며, 자문기구에는 적용하지 않음\n\n"
         "**검토 방법**:\n"
         "1) 조례 제1조부터 마지막 조문까지 하나씩 검토\n"
         "2) 각 조례 조문의 내용과 관련된 상위법령 조문을 찾아서 직접 비교\n"
-        "3) **실질적 충돌 여부**를 판단 (형식적 문언 차이가 아닌 실질적 모순 여부)\n"
-        "4) 위에서 제시한 '실제 위법이 아닌 경우'에 해당하는지 먼저 확인\n"
-        "5) '실제 위법인 경우'의 5가지 유형에 해당하는지 검토\n\n"
+        "3) 다음과 같은 구체적 충돌이 있는지 확인:\n"
+        "   - 조례에서 규율하는 내용에 관한 법령이 없는 경우 평등의 원칙, 비례의 원칙, 명확성의 원칙 같은 법의 일반원칙에 위반되지 않는 지 검토\n"
+        "   - 조례의 목적과 취지가 법령의 목적과 취지와 같은 경우에도 법령의 취지가 전국에 걸쳐 일률적인 규율을 하려는 것이 아니라 각 지자체가 지방 실정에 맞게 별도로 규율하는 것을 용인한다고 해설될때는 법령에 위반 되는 것이 아님 \n"
+        "   - 수익적 내용이면 법령에 근거가 없어도 조례로 정할 수 있으므로 법령에서 조례로 다르게 정할 수 없다고 규정하지 않는 이상 법령과 다르게 조례에 규정할 수 있는 여지가 많음\n"
+        "   - 침익적 내용이면 법률에서 위임받은 범위에서만 조례로 정할 수 있으므로 법령과 다르게 조례에 규정할 수 있는 여지가 거의 없음\n"
+        "   - 조례가 상위법령보다 강한 의무나 제재를 부과하는 경우\n"
+        "   - 조례가 상위법령의 위임 범위를 명백히 벗어나는 경우\n"
+        "   - 조례가 상위법령에서 국가나 중앙행정기관 소관으로 정한 사무에 관여하는 경우\n\n"
         "**위법 발견 시 반드시 다음 형식으로 구체적으로 명시:**\n"
-        "  🚨 **위법 사항 발견**\n"
+        "  🚨 **위법 사항 발견** (상위 가이드라인 1~4를 충족하는 경우에만 지적)\n"
         "  * **조례 조문**: 제○조 ○항 - \"조례의 정확한 문구\"\n"
         "  * **상위법령**: ○○법 제○조 ○항 - \"상위법령의 정확한 문구\"\n"
-        "  * **충돌 내용**: 구체적으로 어떤 부분이 어떻게 위배되는지 상세 설명\n"
+        "  * **충돌 내용**: 구체적으로 어떤 부분이 어떻게 위배되는지 상세 설명 (추상적 설명 금지)\n"
         "  * **위법 유형**: (법령우위 위반/법률유보 위반/기관위임사무 위반)\n"
+        "  * **위법 판단 근거**: 위 가이드라인 4조 중 어느 요건을 충족하는지 명시 (1)상위법 명령·금지 위반, 2)권리제한·의무부과 근거 부재, 3)국가사무 침해)\n"
         "  * **개선 방안**: 상위법령에 맞는 구체적 수정안\n\n"
-        "**위법 사항이 없는 경우에만** '위법 사항을 발견하지 못했음'이라고 결론짓고,\n"
-        "**의심스러운 부분이 있으면 반드시 지적**하라.\n\n"
+        "**⚠️ 중요: 위법 판단의 엄격성**\n"
+        "- 위법 사항이 없는 경우 '위법 사항을 발견하지 못했음'으로 명확히 결론\n"
+        "- 의심스러운 부분이 있더라도 **위 가이드라인 1~4를 충족하지 않으면 위법으로 판단하지 않음**\n"
+        "- 단순 표현 차이, 타 지자체와의 조문 구성 차이만으로는 위법성을 지적하지 않음\n"
+        "- 포괄조항, 자동해산 조항, 자문기구 운영 조항 등 자치입법권 범위 내 사항은 위법으로 보지 않음\n\n"
         "4. 실무적 검토 포인트\n"
         "- 조례의 집행 과정에서 발생할 수 있는 문제점\n"
         "- 개선이 필요한 부분과 그 방향성\n\n"
@@ -1766,26 +1891,28 @@ def create_analysis_prompt(pdf_text, search_results, superior_laws_content=None,
                     prompt += f"  {article['number']} {article['title']}\n"
                     prompt += f"  {article['content'][:300]}...\n\n"
 
-            prompt += f"**🔍 {base_name} 세부 검토 지시사항:**\n"
+            prompt += f"**🔍 {base_name} 세부 검토 지시사항: (⚠️ 상위 법리적 가이드라인 1~4 준수)**\n"
             prompt += "위 상위법령 본문을 조례와 한 조문씩 직접 대조하여 다음을 수행하라:\n\n"
-            prompt += "  ① **조문별 직접 대조 분석**\n"
+            prompt += "  ① **조문별 직접 대조 분석** (단순 차이는 위법이 아님)\n"
             prompt += f"  - 조례의 각 조문이 {base_name}의 어떤 조문과 관련되는지 식별\n"
             prompt += f"  - {base_name}에서 금지/허용/의무화하는 사항과 조례 내용 직접 비교\n"
-            prompt += "  - 상충되는 부분이 있으면 구체적으로 지적\n\n"
-            prompt += "  ② **권한 범위 초과 여부**\n"
-            prompt += f"  - {base_name}에서 국가/중앙행정기관 전담으로 정한 사무가 있는지 확인\n"
-            prompt += "  - 조례가 해당 사무에 개입하고 있는지 점검\n"
-            prompt += "  - 위임 범위를 벗어난 규정이 있는지 확인\n\n"
-            prompt += "  ③ **구체적 위법 사항 발견 시**\n"
+            prompt += "  - **명백한 상충**이 있을 때만 지적 (단순 표현 차이, 조문 구성 차이는 제외)\n\n"
+            prompt += "  ② **권한 범위 초과 여부** (자치입법권 범위 고려)\n"
+            prompt += f"  - {base_name}에서 국가/중앙행정기관 전담으로 '명시적'으로 정한 사무가 있는지 확인\n"
+            prompt += "  - 조례가 해당 사무에 개입하고 있는지 점검 (단, 위임 규정이 있으면 적법)\n"
+            prompt += "  - 위임 범위를 '명백히' 벗어난 규정이 있는지 확인 (해석상 여지가 있으면 위법 아님)\n\n"
+            prompt += "  ③ **구체적 위법 사항 발견 시** (⚠️ 가이드라인 4조 요건 충족 시에만)\n"
             prompt += "  🚨 **위법 발견 보고 형식:**\n"
             prompt += "  * **문제 조문**: 조례 제○조 - \"정확한 조문 내용\"\n"
             prompt += f"  * **관련 상위법령**: {base_name} 제○조 - \"정확한 조문 내용\"\n"
-            prompt += "  * **위법 사유**: 구체적인 충돌/위반 내용\n"
+            prompt += "  * **위법 사유**: 구체적인 충돌/위반 내용 (추상적 설명 금지)\n"
+            prompt += "  * **가이드라인 4조 충족 여부**: (1)상위법 명령·금지 위반 / (2)권리제한·의무부과 근거 부재 / (3)국가사무 침해 중 해당 항목 명시\n"
             prompt += "  * **위법 심각도**: 경미/보통/심각\n"
             prompt += "  * **수정 방안**: 구체적인 개선 방향\n\n"
-            prompt += "  ④ **의심 사항도 반드시 보고**\n"
-            prompt += "  - 명확하지 않지만 위법 가능성이 있는 부분\n"
-            prompt += "  - 해석에 따라 문제가 될 수 있는 조문\n\n"
+            prompt += "  ④ **위법이 아닌 경우 명확히 기재**\n"
+            prompt += "  - 단순 표현 차이, 조문 구성 차이는 '위법 아님'으로 명시\n"
+            prompt += "  - 포괄조항, 자동해산 조항, 자문기구 운영 조항 등은 '자치입법권 범위 내 적법'으로 판단\n"
+            prompt += "  - 의심 사항이 있더라도 가이드라인 1~4를 충족하지 않으면 '위법 아님'으로 결론\n\n"
 
             section_num += 1
 
@@ -2032,6 +2159,47 @@ def create_comparison_document(pdf_text, search_results, analysis_results, super
                 doc.add_paragraph(f"❌ {result['model']} 오류: {result['error']}")
 
     return doc
+
+def send_error_report(subject, body, attachment_data=None, attachment_name=None):
+    """이메일 전송 함수"""
+    try:
+        # secrets에서 이메일 설정 로드
+        email_config = st.secrets.get("email", {})
+        sender_email = email_config.get("sender_email")
+        sender_password = email_config.get("sender_password")
+        receiver_email = "lsh4676@korea.kr"
+
+        if not sender_email or not sender_password:
+            st.error("이메일 설정이 올바르지 않습니다. .streamlit/secrets.toml을 확인해주세요.")
+            return False
+
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+        msg['Subject'] = subject
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        if attachment_data and attachment_name:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment_data)
+            encoders.encode_base64(part)
+            part.add_header(
+                'Content-Disposition',
+                f'attachment; filename= {attachment_name}',
+            )
+            msg.attach(part)
+
+        # SMTP 서버 연결 (Gmail 예시)
+        with smtplib.SMTP('smtp.gmail.com', 587) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+        
+        return True
+    except Exception as e:
+        st.error(f"이메일 전송 중 오류 발생: {str(e)}")
+        return False
 
 def main():
     # 헤더
@@ -2597,7 +2765,7 @@ def main():
                                 
                                 # 상위법령 내용 미리보기 (계층별 그룹화) - expander로 변경하여 재실행 방지
                                 with st.expander("🔍 조회된 상위법령 내용 미리보기 (계층별)", expanded=False):
-                                    for law_group in superior_laws_content:
+                                    for idx, law_group in enumerate(superior_laws_content):
                                         base_name = law_group['base_name']
 
                                         # 연결된 본문이 있는 경우
@@ -3218,7 +3386,7 @@ def main():
                                 openai_prompt = create_analysis_prompt(pdf_text, search_results_for_analysis, superior_laws_content, relevant_guidelines, is_first_ordinance, comprehensive_analysis_results, theoretical_results)
                                 
                                 response = openai.ChatCompletion.create(
-                                    model="gpt-4",
+                                    model="gpt-4o-mini",
                                     messages=[
                                         {"role": "system", "content": "당신은 법률 전문가입니다. 조례 분석과 검토를 도와주세요."},
                                         {"role": "user", "content": openai_prompt}
@@ -3353,6 +3521,42 @@ def main():
                                 )
                         else:
                             st.error("분석 결과가 없습니다.")
+
+    # --------------------------------------------------------------------------
+    # 오류 제보 기능 (AI 분석 버튼과 분리하여 하단에 배치)
+    # --------------------------------------------------------------------------
+    st.divider()
+    with st.expander("🚨 AI 분석 오류 제보 (Report Error)", expanded=False):
+        st.markdown("AI 분석 결과가 이상하거나 오류가 발생한 경우 제보해주세요.")
+        
+        with st.form("error_report_form"):
+            report_content = st.text_area("오류 내용 / 불편 사항", height=150, placeholder="구체적인 오류 내용이나 개선 요청사항을 적어주세요.")
+            uploaded_file = st.file_uploader("화면 캡처 첨부 (선택사항)", type=['png', 'jpg', 'jpeg'])
+            
+            submit_report = st.form_submit_button("제보하기")
+            
+            if submit_report:
+                if not report_content:
+                    st.warning("내용을 입력해주세요.")
+                else:
+                    with st.spinner("제보 내용을 전송하고 있습니다..."):
+                        # 첨부파일 처리
+                        attachment_data = None
+                        attachment_name = None
+                        if uploaded_file is not None:
+                            attachment_data = uploaded_file.getvalue()
+                            attachment_name = uploaded_file.name
+                        
+                        # 이메일 전송
+                        subject = f"[조례분석AI] 오류 제보: {report_content[:20]}..."
+                        body = f"내용:\n{report_content}\n\n(첨부파일 있음)" if attachment_data else f"내용:\n{report_content}"
+                        
+                        success = send_error_report(subject, body, attachment_data, attachment_name)
+                        
+                        if success:
+                            st.success("✅ 제보가 성공적으로 전송되었습니다. 소중한 의견 감사합니다!")
+                        else:
+                            st.error("❌ 전송에 실패했습니다. 잠시 후 다시 시도해주세요.")
 
 if __name__ == "__main__":
     main()
